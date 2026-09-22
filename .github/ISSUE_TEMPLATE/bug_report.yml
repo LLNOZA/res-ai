@@ -1,0 +1,53 @@
+name: Bug report
+description: Report a reproducible problem without sharing private data.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, private endpoints, real conversations, recordings, personal data, or unredacted logs. Use the private security-report link for suspected vulnerabilities.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: Release version or full commit SHA
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Explain what happened and what you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Use synthetic text and redact all identifiers.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Accessibility and text replacement
+        - AI request or response
+        - Voice input
+        - Settings or local storage
+        - Proxy service
+        - Build, install, or release
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Data-safety confirmation
+      options:
+        - label: I removed credentials, private endpoints, personal data, real user content, recordings, and unredacted logs.
+          required: true
+        - label: This report does not disclose an unpatched vulnerability.
+          required: true

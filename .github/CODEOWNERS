@@ -1,0 +1,9 @@
+# Repository-wide ownership. Keep this synchronized with maintainer access.
+* @LLNOZA
+
+# Security-sensitive surfaces.
+/Sources/ResAICore/ @LLNOZA
+/services/vertex-proxy/ @LLNOZA
+/scripts/ @LLNOZA
+/.github/ @LLNOZA
+/packaging/ @LLNOZA
