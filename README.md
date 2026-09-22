@@ -292,3 +292,7 @@ RESAI_DISABLE_BUNDLED_PROXY=1 ./scripts/run_app.sh
 - Add deeper app-specific extractors for Slack, Chrome Messenger, Gmail, LINE, Teams, and Discord.
 - Replace development shared secret with user/team auth before public release.
 - Package with Developer ID signing and notarization.
+
+## License
+
+ResponseAi is licensed under the [Apache License 2.0](LICENSE).
