@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+LEGACY_APP="/Applications/ResAI.app"
+
+if [ -d "$LEGACY_APP" ]; then
+  rm -rf "$LEGACY_APP"
+fi
+
+exit 0

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>ResponseAi</string>
+	<key>CFBundleIconFile</key>
+	<string>ResponseAi</string>
+	<key>CFBundleIdentifier</key>
+	<string>ai.res.resai</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>ResponseAi</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.3.6</string>
+	<key>CFBundleVersion</key>
+	<string>11</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSAppSleepDisabled</key>
+	<true/>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>ResponseAi uses local automation only to keep focus in the current text field while replacing your draft.</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2026 ResponseAi</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>ResponseAi uses the microphone only while you hold the voice input shortcut, to transcribe your speech on this Mac.</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>ResponseAi uses visible text recognition only to read conversation context above the focused reply box when browser apps do not expose enough text through Accessibility.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>ResponseAi transcribes your speech on-device with Apple speech recognition while the voice input shortcut is held.</string>
+</dict>
+</plist>
