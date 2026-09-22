@@ -24,6 +24,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Install policy-check dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ripgrep
       - name: Install pinned gitleaks
         shell: bash
         run: |
@@ -41,7 +45,7 @@ jobs:
 
   swift-tests:
     name: Swift tests
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 20
     steps:
       - name: Check out source
