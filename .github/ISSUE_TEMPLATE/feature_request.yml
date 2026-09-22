@@ -1,0 +1,33 @@
+name: Feature request
+description: Propose a focused improvement to ResponseAi.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the user problem without including real user content or personal data.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+    validations:
+      required: true
+  - type: textarea
+    id: privacy
+    attributes:
+      label: Security and privacy impact
+      description: Explain effects on accessibility access, user data, storage, logging, networking, prompts, and model output.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Data-safety confirmation
+      options:
+        - label: I did not include credentials, private endpoints, personal data, real user content, recordings, or unredacted logs.
+          required: true

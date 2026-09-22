@@ -24,6 +24,12 @@ Run the gate with:
 
 The repository's pre-push hook runs the same gate automatically.
 
+Public development and maintenance follow these repository-wide policies:
+
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) for changes, tests, and pull requests
+- [`SECURITY.md`](SECURITY.md) for private vulnerability reporting
+- [`docs/maintainer-operations.md`](docs/maintainer-operations.md) for branch, release, access, and incident controls
+
 The UI is intentionally small:
 
 - a menu bar item

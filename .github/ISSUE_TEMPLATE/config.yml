@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Private security report
+    url: https://github.com/LLNOZA/res-ai/security/advisories/new
+    about: Report suspected vulnerabilities privately. Do not include sensitive details in a public issue.
