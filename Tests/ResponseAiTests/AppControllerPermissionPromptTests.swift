@@ -74,6 +74,61 @@ final class AppControllerPermissionPromptTests: XCTestCase {
         XCTAssertEqual(probe.openedSettingsURLs.count, 2)
     }
 
+    func testMonitorStillDetectsGrantAfterTheFastPhaseEnds() async throws {
+        let probe = PermissionProbe()
+        let controller = makeController(
+            probe: probe,
+            schedule: PermissionPollSchedule(
+                fastAttempts: 2,
+                fastInterval: .milliseconds(10),
+                slowInterval: .milliseconds(50),
+                slowLogEvery: 10
+            )
+        )
+        defer { controller.shutDown() }
+
+        controller.observeHotKeyPermissionsIfNeeded()
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertFalse(controller.hotKeyPermissionsAreGranted)
+
+        var shortcutsConfigured = false
+        controller.onHotKeyPermissionsGranted = {
+            shortcutsConfigured = true
+            return true
+        }
+        probe.accessibilityGranted = true
+        probe.inputMonitoringGranted = true
+        try await Task.sleep(for: .milliseconds(300))
+
+        XCTAssertTrue(shortcutsConfigured)
+    }
+
+    func testAccessibilityRequestIsRememberedAndGrantIsRecordedWithSigningIdentity() async throws {
+        let probe = PermissionProbe()
+        let controller = makeController(probe: probe)
+        defer { controller.shutDown() }
+
+        XCTAssertEqual(controller.accessibilityGrantDiagnosis, .notYetGranted)
+        controller.requestHotKeyPermissionsFromUserAction(showAlert: false)
+        XCTAssertTrue(probe.grantHistory.hasRequestedAccessibilityBefore)
+        XCTAssertEqual(controller.accessibilityGrantDiagnosis, .staleGrantLikely(.requestedButNeverApplied))
+
+        probe.accessibilityGranted = true
+        try await Task.sleep(for: .seconds(1.2))
+
+        XCTAssertEqual(probe.grantHistory.lastGrantedSigningFingerprint, PermissionProbe.signingIdentity.fingerprint)
+        XCTAssertFalse(probe.grantHistory.hasRequestedAccessibilityBefore)
+    }
+
+    func testGrantMadeForAnotherSigningIdentityIsDiagnosedAsStale() {
+        let probe = PermissionProbe()
+        probe.grantHistory.recordGranted(signingFingerprint: "team=OLDTEAM signer=old", version: "0.3.3 (12)")
+        let controller = makeController(probe: probe)
+        defer { controller.shutDown() }
+
+        XCTAssertEqual(controller.accessibilityGrantDiagnosis, .staleGrantLikely(.signingIdentityChanged))
+    }
+
     private var environments: [AppEnvironment] = []
 
     override func tearDown() async throws {
@@ -84,7 +139,7 @@ final class AppControllerPermissionPromptTests: XCTestCase {
         try await super.tearDown()
     }
 
-    private func makeController(probe: PermissionProbe) -> AppController {
+    private func makeController(probe: PermissionProbe, schedule: PermissionPollSchedule = .standard) -> AppController {
         let environment = AppEnvironment.isolated(openURL: { url in
             probe.openedSettingsURLs.append(url)
             return true
@@ -92,7 +147,10 @@ final class AppControllerPermissionPromptTests: XCTestCase {
         environments.append(environment)
         return AppController(
             permissionManager: probe.makeManager(),
-            environment: environment
+            environment: environment,
+            grantHistory: probe.grantHistory,
+            signingIdentity: PermissionProbe.signingIdentity,
+            permissionPollSchedule: schedule
         )
     }
 }
@@ -103,6 +161,14 @@ private final class PermissionProbe {
     var accessibilityRequestCount = 0
     var inputMonitoringRequestCount = 0
     var openedSettingsURLs: [URL] = []
+
+    static let signingIdentity = CodeSigningIdentity(teamID: "TESTTEAM", signerName: "Developer ID Application: Test (TESTTEAM)", isAdHoc: false)
+    private let suiteName = "AppControllerPermissionPromptTests.\(UUID().uuidString)"
+    private(set) lazy var grantHistory = AccessibilityGrantHistory(defaults: UserDefaults(suiteName: suiteName)!)
+
+    deinit {
+        UserDefaults().removePersistentDomain(forName: suiteName)
+    }
 
     func makeManager() -> AccessibilityPermissionManager {
         AccessibilityPermissionManager(

@@ -96,7 +96,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        AppLog.write("app launched version=\(AppVersionInfo.version) build=\(AppVersionInfo.build) os=\(AppVersionInfo.operatingSystem) model=\(AppVersionInfo.hardwareModel) speech=\(SpeechDictationEngineFactory.engineName)")
+        // Version and signer decide whether existing permission grants still apply,
+        // so record them with every launch for diagnosis from the log alone.
+        AppLog.write("app launched version=\(AppVersionInfo.version) build=\(AppVersionInfo.build) os=\(AppVersionInfo.operatingSystem) model=\(AppVersionInfo.hardwareModel) speech=\(SpeechDictationEngineFactory.engineName) \(controller.signingIdentity.logDescription) path=\(Bundle.main.bundlePath)")
+        controller.logSigningIdentityChangeSinceLastLaunch()
         startCrashDiagnostics()
         configureControllerCallbacks()
         if controller.hotKeyPermissionsAreGranted {

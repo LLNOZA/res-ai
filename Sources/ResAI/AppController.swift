@@ -65,6 +65,18 @@ final class AppController: ObservableObject {
     /// Settings, Keychain, clipboard, and System Settings access. Isolated in tests.
     let environment: AppEnvironment
 
+    var accessibilityGrantDiagnosis: AccessibilityGrantDiagnosis {
+        AccessibilityGrantDiagnosis.diagnose(
+            accessibilityTrusted: permissionManager.isTrusted,
+            inputMonitoringGranted: permissionManager.isInputMonitoringEnabled,
+            currentSigningFingerprint: signingIdentity.fingerprint,
+            lastGrantedSigningFingerprint: grantHistory.lastGrantedSigningFingerprint,
+            hasRequestedAccessibilityBefore: grantHistory.hasRequestedAccessibilityBefore
+        )
+    }
+
+    let signingIdentity: CodeSigningIdentity
+
     private let permissionManager: AccessibilityPermissionManager
     private let reader: AccessibilityReader
     private let formReader: FormReader
@@ -76,6 +88,9 @@ final class AppController: ObservableObject {
     private var pendingFormFill: PendingFormFill?
     private var permissionMonitorTask: Task<Void, Never>?
     private var didRequestInputMonitoringDuringCurrentOnboarding = false
+    private let grantHistory: AccessibilityGrantHistory
+    private let permissionPollSchedule: PermissionPollSchedule
+    private var didRecordAccessibilityGrantThisLaunch = false
     private var operationTask: Task<Void, Never>?
     private var statusResetTask: Task<Void, Never>?
 
@@ -85,7 +100,12 @@ final class AppController: ObservableObject {
         formReader: FormReader = FormReader(),
         formPlanner: FormFillPlanning = FormFillPlanner(),
         replacer: TextReplacer = TextReplacer(),
-        environment: AppEnvironment = .current
+        environment: AppEnvironment = .current,
+        // Optional with nil defaults: Swift 6.0 crashes in SILGen when these carry
+        // non-nil defaults next to the main-actor-isolated `environment` default.
+        grantHistory: AccessibilityGrantHistory? = nil,
+        signingIdentity: CodeSigningIdentity? = nil,
+        permissionPollSchedule: PermissionPollSchedule? = nil
     ) {
         self.permissionManager = permissionManager
         self.reader = reader
@@ -93,6 +113,10 @@ final class AppController: ObservableObject {
         self.formPlanner = formPlanner
         self.replacer = replacer
         self.environment = environment
+        // Grant history lives in the environment's settings so tests never touch real ones.
+        self.grantHistory = grantHistory ?? AccessibilityGrantHistory(defaults: environment.defaults)
+        self.signingIdentity = signingIdentity ?? .current()
+        self.permissionPollSchedule = permissionPollSchedule ?? .standard
         let defaults = environment.defaults
         let secretStore = environment.secretStore
         self.config = VertexAIConfig.load(defaults: defaults, secretStore: secretStore)
@@ -739,13 +763,32 @@ final class AppController: ObservableObject {
     /// Observe TCC state without invoking either system permission request API.
     /// Only an explicit user action may call `requestHotKeyPermissionsFromUserAction`.
     func observeHotKeyPermissionsIfNeeded() {
+        recordAccessibilityGrantIfTrusted()
         guard !hotKeyPermissionsAreGranted else {
             AppLog.write("keyboard permissions granted")
             return
         }
-        AppLog.write("keyboard permission observation started state=\(permissionManager.hotKeyPermissionState)")
+        AppLog.write("keyboard permission observation started state=\(permissionManager.hotKeyPermissionState) diagnosis=\(accessibilityGrantDiagnosis.logLabel)")
         startPermissionMonitor(continueUserInitiatedOnboarding: false)
     }
+
+    /// Logs when the signing identity differs from the previous launch, because
+    /// macOS then stops applying grants made for the old identity.
+    func logSigningIdentityChangeSinceLastLaunch() {
+        guard let previous = grantHistory.recordLaunch(signingFingerprint: signingIdentity.fingerprint) else {
+            return
+        }
+        AppLog.write("signing identity changed since last launch previous=\"\(previous)\" current=\"\(signingIdentity.fingerprint)\" existing Accessibility/Input Monitoring grants may no longer apply")
+    }
+
+    private func recordAccessibilityGrantIfTrusted() {
+        guard !didRecordAccessibilityGrantThisLaunch, permissionManager.isTrusted else {
+            return
+        }
+        didRecordAccessibilityGrantThisLaunch = true
+        grantHistory.recordGranted(signingFingerprint: signingIdentity.fingerprint, version: "\(AppVersionInfo.version) (\(AppVersionInfo.build))")
+    }
+
 
     func requestHotKeyPermissionsFromUserAction(showAlert: Bool = true) {
         let state = permissionManager.hotKeyPermissionState
@@ -767,7 +810,8 @@ final class AppController: ObservableObject {
         case .granted:
             return
         case .accessibilityRequired, .accessibilityAndInputMonitoringRequired:
-            AppLog.write("accessibility permission requested")
+            AppLog.write("accessibility permission requested diagnosis=\(accessibilityGrantDiagnosis.logLabel)")
+            grantHistory.recordAccessibilityRequested()
             _ = permissionManager.requestPermissionPrompt()
             openAccessibilitySettings()
         case .inputMonitoringRequired:
@@ -790,12 +834,34 @@ final class AppController: ObservableObject {
         case .granted:
             "アクセシビリティと入力監視は有効です。"
         case .accessibilityRequired:
-            "システム設定 > プライバシーとセキュリティ > アクセシビリティでResponseAiをオンにしてください。"
+            accessibilityGrantDiagnosis.isStaleGrantLikely
+                ? Self.staleAccessibilityGrantGuidance
+                : "システム設定 > プライバシーとセキュリティ > アクセシビリティでResponseAiをオンにしてください。\n\n" + Self.removeAndReAddFallback
         case .inputMonitoringRequired:
             "システム設定 > プライバシーとセキュリティ > 入力監視でResponseAiをオンにしてください。macOSから求められた場合はResponseAiを再起動してください。"
         case .accessibilityAndInputMonitoringRequired:
-            "まずアクセシビリティでResponseAiをオンにしてください。反映後、入力監視が必要な場合は続けて案内します。"
+            accessibilityGrantDiagnosis.isStaleGrantLikely
+                ? Self.staleAccessibilityGrantGuidance
+                : "まずアクセシビリティでResponseAiをオンにしてください。反映後、入力監視が必要な場合は続けて案内します。\n\n" + Self.removeAndReAddFallback
         }
+    }
+
+    // Toggling an entry that was granted to a different signature never applies, so
+    // the guidance must say to remove the entry rather than only to switch it on.
+    static let staleAccessibilityGrantGuidance = """
+        以前の許可が古いまま残っている可能性が高いです。アクセシビリティの一覧でResponseAiがオンになっていても、macOSはこのResponseAiを許可済みとして扱っていません。
+
+        1. システム設定 > プライバシーとセキュリティ > アクセシビリティを開く
+        2. ResponseAiを選んで「−」で削除する（オン／オフの切り替えでは直りません）
+        3. 「＋」で /Applications/ResponseAi.app を追加してオンにする
+        """
+
+    static let removeAndReAddFallback = "すでにオンなのに使えない場合は、一覧のResponseAiを「−」で削除し、「＋」で追加し直してください。"
+
+    private var accessibilityShortDetail: String {
+        accessibilityGrantDiagnosis.isStaleGrantLikely
+            ? "一覧から−で削除→＋で追加し直す"
+            : "アクセシビリティをオン"
     }
 
     func requestScreenRecordingPermission() {
@@ -844,7 +910,7 @@ final class AppController: ObservableObject {
         case .granted:
             detail = ready ? shortcuts.rewrite.displayName : "メニューからショートカットを修復"
         case .accessibilityRequired, .accessibilityAndInputMonitoringRequired:
-            detail = "アクセシビリティをオン"
+            detail = accessibilityShortDetail
         case .inputMonitoringRequired:
             detail = "入力監視をオン"
         }
@@ -1202,7 +1268,11 @@ final class AppController: ObservableObject {
             ? "隠れています メニューバーアイコン（ノッチ）"
             : "OK メニューバーアイコン"
         let lines = [
-            "\(accessibilityOK ? "OK" : "未許可") アクセシビリティ",
+            accessibilityOK
+                ? "OK アクセシビリティ"
+                : (accessibilityGrantDiagnosis.isStaleGrantLikely
+                    ? "未許可 アクセシビリティ（古い許可が残っている可能性。一覧から−で削除→＋で追加）"
+                    : "未許可 アクセシビリティ"),
             "\(inputMonitoringOK ? "OK" : "未許可") 入力監視",
             "\(screenRecordingOK ? "OK" : "未許可") 画面収録",
             "AI経路: \(route.displayName)",
@@ -1331,9 +1401,12 @@ final class AppController: ObservableObject {
                 return
             }
 
-            for attempt in 1...120 {
-                guard !Task.isCancelled else { return }
+            let schedule = self.permissionPollSchedule
+            var attempt = 0
+            while !Task.isCancelled {
+                attempt += 1
                 let state = self.permissionManager.hotKeyPermissionState
+                self.recordAccessibilityGrantIfTrusted()
                 if state == .granted {
                     let shortcutsReady = self.onHotKeyPermissionsGranted?() ?? false
                     AppLog.write("keyboard permissions granted after monitor attempt=\(attempt)")
@@ -1354,24 +1427,26 @@ final class AppController: ObservableObject {
                     self.requestInputMonitoringPermission()
                 }
 
-                if attempt == 1 || attempt % 10 == 0 {
+                if schedule.shouldLog(attempt: attempt) {
                     AppLog.write("keyboard permissions pending state=\(state) attempt=\(attempt)")
                 }
 
-                do { try await Task.sleep(for: .seconds(1)) } catch { return }
-            }
+                // Keep checking at a slower pace instead of giving up: a grant made
+                // after the fast phase must still register without a relaunch.
+                if schedule.isFastPhaseEnd(attempt) {
+                    AppLog.write("keyboard permission monitor slowed state=\(state) diagnosis=\(self.accessibilityGrantDiagnosis.logLabel)")
+                    if continueUserInitiatedOnboarding {
+                        self.showHUD(HUDMessage(
+                            title: "権限がまだ未反映です",
+                            detail: self.hotKeyPermissionTimeoutDetail(for: state),
+                            tone: .warning,
+                            duration: 5.0
+                        ))
+                    }
+                }
 
-            let state = self.permissionManager.hotKeyPermissionState
-            AppLog.write("keyboard permission monitor timed out state=\(state)")
-            if continueUserInitiatedOnboarding {
-                self.showHUD(HUDMessage(
-                    title: "権限がまだ未反映です",
-                    detail: self.hotKeyPermissionTimeoutDetail(for: state),
-                    tone: .warning,
-                    duration: 5.0
-                ))
+                do { try await Task.sleep(for: schedule.interval(afterAttempt: attempt)) } catch { return }
             }
-            self.permissionMonitorTask = nil
         }
     }
 
@@ -1380,7 +1455,9 @@ final class AppController: ObservableObject {
         case .granted:
             "「ショートカットを修復」を実行"
         case .accessibilityRequired, .accessibilityAndInputMonitoringRequired:
-            "アクセシビリティをオンにしてください"
+            accessibilityGrantDiagnosis.isStaleGrantLikely
+                ? "一覧からResponseAiを−で削除し、＋で追加し直してください"
+                : "アクセシビリティをオンにしてください"
         case .inputMonitoringRequired:
             "入力監視をオン（反映しない場合は再起動）"
         }

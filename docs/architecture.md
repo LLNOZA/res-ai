@@ -41,6 +41,8 @@ If replacement cannot be verified after the app attempts to insert text, Respons
 
 Accessibility and Input Monitoring request APIs are invoked only from an explicit permission action in the menu or Settings. Launch, feature attempts, lifecycle recovery, and the permission monitor only preflight the current TCC state; they never trigger another system permission prompt.
 
+The permission monitor polls every second for two minutes, then every 30 seconds until the grant arrives or the app quits, so a grant made later still takes effect without a relaunch. ResponseAi records the signing identity that last held Accessibility and whether a request was made. When Accessibility is missing but a previous grant, an Input Monitoring grant, or an unanswered request exists, it treats the grant as stale: an entry granted to a different signature stays switched on in System Settings but no longer applies, so the guidance tells the user to remove the entry with "−" and add the app again. Every launch logs the version, build, team ID, signer, and bundle path, and logs a separate line when the signing identity differs from the previous launch.
+
 ## Native layers
 
 ### App Bundle

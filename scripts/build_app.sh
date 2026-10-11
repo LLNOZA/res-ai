@@ -12,35 +12,26 @@ LEGACY_APP_DIR="$ROOT_DIR/dist/ResAI.app"
 
 cd "$ROOT_DIR"
 
+# macOS keys Accessibility and Input Monitoring grants to the signing identity.
+# Picking whatever certificate the build Mac happens to hold, or falling back to
+# ad-hoc signing, silently changes that identity and invalidates every user's
+# grants on update, so the identity must always be chosen explicitly.
 SIGN_IDENTITY="${RESAI_CODESIGN_IDENTITY:-}"
-if command -v codesign >/dev/null 2>&1 \
-  && [[ -z "$SIGN_IDENTITY" ]] \
-  && command -v security >/dev/null 2>&1; then
-  DEVELOPER_ID_IDENTITIES="$(
-    security find-identity -v -p codesigning 2>/dev/null \
-      | awk -F '"' '/Developer ID Application:/ { print $2 }'
-  )"
-  DEVELOPER_ID_COUNT="$(printf '%s\n' "$DEVELOPER_ID_IDENTITIES" | awk 'NF { count++ } END { print count + 0 }')"
-  if [[ "$DEVELOPER_ID_COUNT" -gt 1 ]]; then
-    echo "Multiple Developer ID Application identities found. Set RESAI_CODESIGN_IDENTITY explicitly to keep the app identity stable." >&2
-    exit 1
-  elif [[ "$DEVELOPER_ID_COUNT" -eq 1 ]]; then
-    SIGN_IDENTITY="$(printf '%s\n' "$DEVELOPER_ID_IDENTITIES" | awk 'NF { print; exit }')"
-  fi
-
-  if [[ -z "$SIGN_IDENTITY" ]]; then
-    APPLE_DEVELOPMENT_IDENTITIES="$(
-      security find-identity -v -p codesigning 2>/dev/null \
-        | awk -F '"' '/Apple Development:/ { print $2 }'
-    )"
-    APPLE_DEVELOPMENT_COUNT="$(printf '%s\n' "$APPLE_DEVELOPMENT_IDENTITIES" | awk 'NF { count++ } END { print count + 0 }')"
-    if [[ "$APPLE_DEVELOPMENT_COUNT" -gt 1 ]]; then
-      echo "Multiple Apple Development identities found. Set RESAI_CODESIGN_IDENTITY explicitly to keep Accessibility and Input Monitoring grants stable across updates." >&2
-      exit 1
-    elif [[ "$APPLE_DEVELOPMENT_COUNT" -eq 1 ]]; then
-      SIGN_IDENTITY="$(printf '%s\n' "$APPLE_DEVELOPMENT_IDENTITIES" | awk 'NF { print; exit }')"
-    fi
-  fi
+if [[ -z "$SIGN_IDENTITY" ]]; then
+  echo "RESAI_CODESIGN_IDENTITY is required. Set it to the release signing identity (certificate name or SHA-1 hash) so Accessibility and Input Monitoring grants survive updates." >&2
+  exit 1
+fi
+if [[ "$SIGN_IDENTITY" == "-" ]]; then
+  echo "Ad-hoc signing (RESAI_CODESIGN_IDENTITY=-) is not allowed: its identity changes on every build and macOS discards Accessibility and Input Monitoring grants." >&2
+  exit 1
+fi
+if ! command -v codesign >/dev/null 2>&1 || ! command -v security >/dev/null 2>&1; then
+  echo "codesign and security are required to sign ResponseAi.app." >&2
+  exit 1
+fi
+if ! security find-identity -v -p codesigning 2>/dev/null | grep -F -- "$SIGN_IDENTITY" >/dev/null; then
+  echo "Signing identity not found in the keychain: $SIGN_IDENTITY" >&2
+  exit 1
 fi
 
 swift build -c release
@@ -80,15 +71,19 @@ if command -v xcrun >/dev/null 2>&1; then
   xcrun strip -x "$MACOS_DIR/$APP_NAME" || true
 fi
 
-if command -v codesign >/dev/null 2>&1; then
-  # Hardened runtime blocks microphone access outright unless the audio-input
-  # entitlement is present, so the entitlements file must accompany every signature.
-  ENTITLEMENTS="$ROOT_DIR/packaging/ResponseAi.entitlements"
-  if [[ -n "$SIGN_IDENTITY" ]]; then
-    codesign --force --deep --options runtime --entitlements "$ENTITLEMENTS" --sign "$SIGN_IDENTITY" "$APP_DIR" >/dev/null
-  else
-    codesign --force --entitlements "$ENTITLEMENTS" --sign - "$APP_DIR" >/dev/null
-  fi
+# Hardened runtime blocks microphone access outright unless the audio-input
+# entitlement is present, so the entitlements file must accompany every signature.
+ENTITLEMENTS="$ROOT_DIR/packaging/ResponseAi.entitlements"
+codesign --force --deep --options runtime --entitlements "$ENTITLEMENTS" --sign "$SIGN_IDENTITY" "$APP_DIR" >/dev/null
+codesign --verify --strict "$APP_DIR"
+
+# Print the identity macOS will match grants against, so a changed signer is
+# visible at build time instead of after users lose their permissions.
+SIGNED_TEAM_ID="$(codesign -dv "$APP_DIR" 2>&1 | awk -F= '/^TeamIdentifier=/ { print $2 }')"
+if [[ -z "$SIGNED_TEAM_ID" || "$SIGNED_TEAM_ID" == "not set" ]]; then
+  echo "Signed app has no Team ID; refusing to produce a bundle whose permission grants would not survive updates." >&2
+  exit 1
 fi
+echo "Signed with team $SIGNED_TEAM_ID: $(codesign -d -r- "$APP_DIR" 2>&1 | sed -n 's/^designated => //p')" >&2
 
 echo "$APP_DIR"
