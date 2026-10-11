@@ -115,8 +115,8 @@ Build both release artifacts:
 The generated installers are written to:
 
 ```text
-dist/installer/ResponseAi-0.4.2.pkg
-dist/installer/ResponseAi-0.4.2.dmg
+dist/installer/ResponseAi-0.4.3.pkg
+dist/installer/ResponseAi-0.4.3.dmg
 ```
 
 `scripts/build_app.sh` signs the app bundle with the identity in `RESAI_CODESIGN_IDENTITY` and `scripts/build_dmg.sh` signs the DMG with it. If a `Developer ID Installer` certificate is installed, `scripts/build_pkg.sh` signs the installer package. Without those certificates, the scripts still build unsigned local-testing installers.
@@ -144,8 +144,8 @@ RESAI_NOTARIZE=1 \
 You can also notarize one artifact directly:
 
 ```bash
-./scripts/notarize_pkg.sh dist/installer/ResponseAi-0.4.2.pkg
-./scripts/notarize_dmg.sh dist/installer/ResponseAi-0.4.2.dmg
+./scripts/notarize_pkg.sh dist/installer/ResponseAi-0.4.3.pkg
+./scripts/notarize_dmg.sh dist/installer/ResponseAi-0.4.3.dmg
 ```
 
 On first app run, use `ResponseAi > アクセシビリティ／入力監視を開く` (or the `操作権限` button in Settings), then grant Accessibility and Input Monitoring permission to `ResponseAi`:
