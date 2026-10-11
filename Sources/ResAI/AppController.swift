@@ -15,6 +15,10 @@ final class AppController: ObservableObject {
     @Published var userProfile: UserProfile
     @Published var userProfileEnabled: Bool
     @Published var shortcuts: AppShortcuts
+    /// Input buffer for the settings SecureField only. The saved key lives in the Keychain.
+    @Published var claudeAPIKeyInput = ""
+    @Published private(set) var hasClaudeAPIKey: Bool
+    @Published private(set) var claudeConnectionTestResult: String?
 
     let clipboardHistory: ClipboardHistoryStore
     let voiceInput: VoiceInputController
@@ -81,6 +85,7 @@ final class AppController: ObservableObject {
             forKey: UserProfile.DefaultsKey.isEnabled
         ) as? Bool ?? true
         self.shortcuts = AppShortcuts.load()
+        self.hasClaudeAPIKey = ClaudeAPIKeyStore.hasKey()
         self.clipboardHistory = ClipboardHistoryStore()
         self.rewriter = RewriteRouter(configProvider: { VertexAIConfig.load() })
         self.voiceInput = VoiceInputController(
@@ -368,6 +373,9 @@ final class AppController: ObservableObject {
     func saveConfig() {
         do { try config.save() }
         catch { presentError(error); return }
+        if !claudeAPIKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            guard saveClaudeAPIKey() else { return }
+        }
         rewriteLanguage.save()
         savePrivacySettings()
         saveUserProfile()
@@ -375,6 +383,68 @@ final class AppController: ObservableObject {
         voiceInput.saveSettings()
         rewriter = RewriteRouter(configProvider: { [config] in config })
         setStatus("Saved")
+    }
+
+    /// Which backend reply / form / dictation cleanup currently use.
+    var activeAIRoute: AIBackendRoute {
+        .select(hasClaudeKey: hasClaudeAPIKey, config: config)
+    }
+
+    @discardableResult
+    func saveClaudeAPIKey() -> Bool {
+        let key = claudeAPIKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return false }
+        do {
+            try ClaudeAPIKeyStore.save(key)
+        } catch {
+            AppLog.write("claude key save failed: \(error.localizedDescription)")
+            presentError(error)
+            return false
+        }
+        claudeAPIKeyInput = ""
+        hasClaudeAPIKey = ClaudeAPIKeyStore.hasKey()
+        claudeConnectionTestResult = nil
+        AppLog.write("claude key saved")
+        setStatus("Saved")
+        return true
+    }
+
+    func deleteClaudeAPIKey() {
+        do {
+            try ClaudeAPIKeyStore.delete()
+        } catch {
+            AppLog.write("claude key delete failed: \(error.localizedDescription)")
+            presentError(error)
+            return
+        }
+        claudeAPIKeyInput = ""
+        hasClaudeAPIKey = ClaudeAPIKeyStore.hasKey()
+        claudeConnectionTestResult = nil
+        AppLog.write("claude key deleted")
+        setStatus("Cleared")
+    }
+
+    func testClaudeConnection() {
+        let pendingKey = claudeAPIKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !pendingKey.isEmpty || hasClaudeAPIKey else {
+            claudeConnectionTestResult = "APIキーが未設定です"
+            return
+        }
+        claudeConnectionTestResult = "確認中..."
+        // An unsaved key in the field is tested as typed; otherwise the saved Keychain key is used.
+        let client = ClaudeAPIClient(apiKeyProvider: {
+            pendingKey.isEmpty ? ClaudeAPIKeyStore.load() : pendingKey
+        })
+        Task { @MainActor [weak self] in
+            do {
+                try await client.verifyAPIKey()
+                self?.claudeConnectionTestResult = "接続OK（Claude API）"
+                AppLog.write("claude connection test ok")
+            } catch {
+                self?.claudeConnectionTestResult = "接続NG: \(error.localizedDescription)"
+                AppLog.write("claude connection test failed: \(error.localizedDescription)")
+            }
+        }
     }
 
     func saveShortcuts(showHUD: Bool = true) {
@@ -932,12 +1002,24 @@ final class AppController: ObservableObject {
         let inputMonitoringOK = permissionManager.isInputMonitoringEnabled
         let screenRecordingOK = ScreenTextReader.hasScreenCaptureAccess()
         let loadedConfig = VertexAIConfig.load()
+        hasClaudeAPIKey = ClaudeAPIKeyStore.hasKey()
+        let route = AIBackendRoute.select(hasClaudeKey: hasClaudeAPIKey, config: loadedConfig)
+        let claudeStatus = await claudeHealthStatus()
         let proxyStatus = await proxyHealthStatus(for: loadedConfig)
+        // With a Claude API key the proxy is no longer on the request path, so its health
+        // check is informational only.
+        let aiUsable = route == .claudeAPI ? claudeStatus.isUsable : proxyStatus.isUsable
+        let proxyLabel: String
+        if route == .claudeAPI {
+            proxyLabel = loadedConfig.proxyURL == nil ? "未設定" : "\(proxyStatus.label)（未使用）"
+        } else {
+            proxyLabel = proxyStatus.label
+        }
         let profileStatus = userProfileEnabled
             ? (userProfile.isEmpty ? "プロフィール オン / 未入力" : "プロフィール オン")
             : "プロフィール オフ"
 
-        let allRequiredOK = accessibilityOK && inputMonitoringOK && proxyStatus.isUsable && (shortcutsAreReady?() ?? false) && voiceInput.isReady
+        let allRequiredOK = accessibilityOK && inputMonitoringOK && aiUsable && (shortcutsAreReady?() ?? false) && voiceInput.isReady
         let menuBarIconLine = menuBarIconHiddenByNotch
             ? "隠れています メニューバーアイコン（ノッチ）"
             : "OK メニューバーアイコン"
@@ -945,14 +1027,16 @@ final class AppController: ObservableObject {
             "\(accessibilityOK ? "OK" : "未許可") アクセシビリティ",
             "\(inputMonitoringOK ? "OK" : "未許可") 入力監視",
             "\(screenRecordingOK ? "OK" : "未許可") 画面収録",
-            "\(proxyStatus.label) AIプロキシ",
+            "AI経路: \(route.displayName)",
+            "\(claudeStatus.label) Claude API（直接）",
+            "\(proxyLabel) AIプロキシ",
             profileStatus
         ] + (shortcutDiagnosticsProvider?() ?? ["未確認 ショートカット"]) + voiceInput.readinessLines(voiceShortcut: shortcuts.voiceTrigger.displayName) + [
             menuBarIconLine,
             shortcutSummary(for: shortcuts)
         ]
 
-        AppLog.write("readiness check ax=\(accessibilityOK) inputMonitoring=\(inputMonitoringOK) screen=\(screenRecordingOK) proxy=\(proxyStatus.label) profile=\(profileStatus) menuBar=\(menuBarIconHiddenByNotch ? "notch-hidden" : "ok")")
+        AppLog.write("readiness check ax=\(accessibilityOK) inputMonitoring=\(inputMonitoringOK) screen=\(screenRecordingOK) route=\(route) claude=\(claudeStatus.label) proxy=\(proxyStatus.label) profile=\(profileStatus) menuBar=\(menuBarIconHiddenByNotch ? "notch-hidden" : "ok")")
         setStatus(allRequiredOK ? "Ready" : "Check")
         onHideHUD?()
         // A three-line HUD truncates the actual microphone/hotkey diagnostics.
@@ -961,6 +1045,24 @@ final class AppController: ObservableObject {
             title: allRequiredOK ? "準備OK" : "ResponseAi 要確認",
             message: lines.joined(separator: "\n")
         )
+    }
+
+    /// Confirms the saved key with `GET /v1/models`, which consumes no tokens.
+    private func claudeHealthStatus() async -> ProxyHealthStatus {
+        guard hasClaudeAPIKey else {
+            return ProxyHealthStatus(label: "未設定", isUsable: false)
+        }
+        do {
+            try await ClaudeAPIClient().verifyAPIKey(timeout: 6)
+            return ProxyHealthStatus(label: "OK", isUsable: true)
+        } catch ClaudeAPIError.apiError(let statusCode) where statusCode == 401 || statusCode == 403 {
+            return ProxyHealthStatus(label: "認証NG", isUsable: false)
+        } catch ClaudeAPIError.apiError(let statusCode) {
+            return ProxyHealthStatus(label: "HTTP \(statusCode)", isUsable: false)
+        } catch {
+            AppLog.write("claude health failed: \(error.localizedDescription)")
+            return ProxyHealthStatus(label: "NG", isUsable: false)
+        }
     }
 
     private func proxyHealthStatus(for config: VertexAIConfig) async -> ProxyHealthStatus {

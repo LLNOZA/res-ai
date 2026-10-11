@@ -417,17 +417,22 @@ public struct LocalFormFillPlanner: FormFillPlanning {
 
 public final class FormFillPlanner: FormFillPlanning {
     private let configProvider: () -> VertexAIConfig
+    private let claudeAPIKeyProvider: () -> String?
     private let localPlanner: FormFillPlanning
     private let urlSession: URLSession
+    private let claudeClient: ClaudeAPIClient
 
     public init(
         configProvider: @escaping () -> VertexAIConfig = { VertexAIConfig.load() },
+        claudeAPIKeyProvider: @escaping () -> String? = { ClaudeAPIKeyStore.load() },
         localPlanner: FormFillPlanning = LocalFormFillPlanner(),
         urlSession: URLSession? = nil
     ) {
         self.configProvider = configProvider
+        self.claudeAPIKeyProvider = claudeAPIKeyProvider
         self.localPlanner = localPlanner
         self.urlSession = urlSession ?? NetworkRequestSafety.session
+        self.claudeClient = ClaudeAPIClient(apiKeyProvider: claudeAPIKeyProvider, urlSession: urlSession)
     }
 
     public func plan(_ request: FormFillRequest) async -> [FormFillSuggestion] {
@@ -437,54 +442,31 @@ public final class FormFillPlanner: FormFillPlanning {
         guard !Task.isCancelled else {
             return []
         }
+        let claudeKey = claudeAPIKeyProvider()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let config = configProvider()
-        guard let proxyURL = config.proxyURL, !request.userProfile.isEmpty else {
+        guard !claudeKey.isEmpty || config.proxyURL != nil, !request.userProfile.isEmpty else {
             guard !Task.isCancelled else { return [] }
             return await localPlanner.plan(request)
         }
 
         do {
-            let payload = CloudRunProxyRewriteRequest(
-                systemInstruction: systemInstruction(),
-                userPrompt: userPrompt(for: request)
-            )
-            var urlRequest = URLRequest(url: proxyURL)
-            guard NetworkRequestSafety.isAllowedURL(proxyURL) else {
+            // A Claude API key wins over the proxy, which stays for the migration period.
+            let generatedText: String?
+            if !claudeKey.isEmpty {
+                generatedText = try await claudeClient.generateText(
+                    systemInstruction: systemInstruction(),
+                    userPrompt: userPrompt(for: request),
+                    maxTokens: ClaudeAPIClient.defaultMaxTokens,
+                    timeout: 20
+                )
+            } else {
+                generatedText = try await proxyText(for: request, config: config)
+            }
+            guard let generatedText else {
                 guard !Task.isCancelled else { return [] }
                 return await localPlanner.plan(request)
             }
-            urlRequest.httpMethod = "POST"
-            urlRequest.timeoutInterval = 20
-            urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            let proxyAuthToken = config.proxyAuthToken.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !proxyAuthToken.isEmpty {
-                urlRequest.setValue(proxyAuthToken, forHTTPHeaderField: "X-ResAI-Proxy-Key")
-            }
-            urlRequest.httpBody = try JSONEncoder().encode(payload)
-            let requestForTransport = urlRequest
-            let session = urlSession
-
-            let (data, response) = try await NetworkRequestSafety.runWithTimeout(
-                20,
-                timeoutError: FormFillNetworkError.timeout
-            ) {
-                try await session.data(for: requestForTransport)
-            }
-            guard
-                let httpResponse = response as? HTTPURLResponse,
-                (200..<300).contains(httpResponse.statusCode)
-            else {
-                guard !Task.isCancelled else { return [] }
-                return await localPlanner.plan(request)
-            }
-
-            let decoded = try JSONDecoder().decode(CloudRunProxyRewriteResponse.self, from: data)
-            if let finishReason = decoded.finishReason,
-               finishReason.uppercased() != "STOP" {
-                guard !Task.isCancelled else { return [] }
-                return await localPlanner.plan(request)
-            }
-            let suggestions = try decodeSuggestions(from: decoded.text)
+            let suggestions = try decodeSuggestions(from: generatedText)
             let filtered = filteredSuggestions(suggestions, request: request)
             guard !Task.isCancelled else { return [] }
             return filtered.isEmpty ? await localPlanner.plan(request) : filtered
@@ -494,6 +476,48 @@ public final class FormFillPlanner: FormFillPlanning {
             guard !Task.isCancelled else { return [] }
             return await localPlanner.plan(request)
         }
+    }
+
+    /// Returns nil when the proxy cannot be used or answered with an unusable response.
+    private func proxyText(for request: FormFillRequest, config: VertexAIConfig) async throws -> String? {
+        guard let proxyURL = config.proxyURL, NetworkRequestSafety.isAllowedURL(proxyURL) else {
+            return nil
+        }
+        let payload = CloudRunProxyRewriteRequest(
+            systemInstruction: systemInstruction(),
+            userPrompt: userPrompt(for: request)
+        )
+        var urlRequest = URLRequest(url: proxyURL)
+        urlRequest.httpMethod = "POST"
+        urlRequest.timeoutInterval = 20
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let proxyAuthToken = config.proxyAuthToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !proxyAuthToken.isEmpty {
+            urlRequest.setValue(proxyAuthToken, forHTTPHeaderField: "X-ResAI-Proxy-Key")
+        }
+        urlRequest.httpBody = try JSONEncoder().encode(payload)
+        let requestForTransport = urlRequest
+        let session = urlSession
+
+        let (data, response) = try await NetworkRequestSafety.runWithTimeout(
+            20,
+            timeoutError: FormFillNetworkError.timeout
+        ) {
+            try await session.data(for: requestForTransport)
+        }
+        guard
+            let httpResponse = response as? HTTPURLResponse,
+            (200..<300).contains(httpResponse.statusCode)
+        else {
+            return nil
+        }
+
+        let decoded = try JSONDecoder().decode(CloudRunProxyRewriteResponse.self, from: data)
+        if let finishReason = decoded.finishReason,
+           finishReason.uppercased() != "STOP" {
+            return nil
+        }
+        return decoded.text
     }
 
     private func systemInstruction() -> String {

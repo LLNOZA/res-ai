@@ -7,10 +7,20 @@ The app runs as a menu bar utility. Press the global hotkey while a reply box is
 1. Reads the focused input field through macOS Accessibility.
 2. Collects nearby text above the input field as conversation context.
 3. Builds a context-aware rewrite prompt with a configurable output language.
-4. Sends the prompt through the Cloud Run proxy to the Claude API (`claude-haiku-5-5` by default; `AI_PROVIDER=vertex` switches the proxy back to Vertex AI Gemini).
+4. Sends the prompt directly to the Claude API (`claude-haiku-5-5`, fixed in code) with the user's own Claude API key. Without a key, it falls back to the Cloud Run proxy, which is kept only for the migration period.
 5. Replaces the focused input text with the generated reply.
 
-If the proxy or Vertex AI credentials are not configured yet, the app uses a local preview rewriter so the native flow can be tested before auth is wired.
+If neither a Claude API key nor the proxy is configured yet, the app uses a local preview rewriter so the native flow can be tested before auth is wired.
+
+### 社内向けの設定（Claude API キー）
+
+社内向けは、各自が自分の Claude API キーを設定画面（`設定 > AI接続 > Claude APIキー`）で入力します。キーは macOS のキーチェーンにだけ保存され、UserDefaults・ログ・アプリ本体には含まれません。「接続テスト」はトークンを消費しない `GET /v1/models` でキーを確認します。設定画面には現在の経路（Claude API 直接 / 中継 / プレビュー）が表示されます。
+
+経路の優先順位は 3 機能（返信生成・フォーム入力・音声入力の整え）共通です:
+
+1. Claude API キーが設定済み → Claude API を直接呼ぶ
+2. キー未設定で中継（Cloud Run proxy）が設定済み → 中継経由（移行期間の互換用。後日撤去予定）
+3. どちらも無い → ローカルプレビュー（音声入力は生テキストのまま。Gemini API キーがあれば従来どおり Gemini で整え）
 
 ## Public Repository Publication Gate
 
@@ -36,7 +46,7 @@ The UI is intentionally small:
 - a tiny non-activating HUD while it reads, writes, and replaces
 - a mode submenu for tone changes
 - one global restore hotkey for the last replaced draft
-- a readiness check that verifies permissions and the AI proxy before use
+- a readiness check that verifies permissions and the AI connection (Claude API key, or the proxy) before use
 
 ## Build And Run
 
@@ -101,8 +111,8 @@ Build both release artifacts:
 The generated installers are written to:
 
 ```text
-dist/installer/ResponseAi-0.3.8.pkg
-dist/installer/ResponseAi-0.3.8.dmg
+dist/installer/ResponseAi-0.4.0.pkg
+dist/installer/ResponseAi-0.4.0.dmg
 ```
 
 If a `Developer ID Application` certificate is installed, `scripts/build_app.sh` uses it for the app bundle and `scripts/build_dmg.sh` signs the DMG. If a `Developer ID Installer` certificate is installed, `scripts/build_pkg.sh` signs the installer package. Without those certificates, the scripts still build unsigned local-testing installers.
@@ -130,8 +140,8 @@ RESAI_NOTARIZE=1 \
 You can also notarize one artifact directly:
 
 ```bash
-./scripts/notarize_pkg.sh dist/installer/ResponseAi-0.3.8.pkg
-./scripts/notarize_dmg.sh dist/installer/ResponseAi-0.3.8.dmg
+./scripts/notarize_pkg.sh dist/installer/ResponseAi-0.4.0.pkg
+./scripts/notarize_dmg.sh dist/installer/ResponseAi-0.4.0.dmg
 ```
 
 On first app run, use `ResponseAi > アクセシビリティ／入力監視を開く` (or the `操作権限` button in Settings), then grant Accessibility and Input Monitoring permission to `ResponseAi`:
@@ -178,7 +188,7 @@ Dictate into the focused field with:
 Command + Shift + Space
 ```
 
-Press the shortcut once to start listening and press it again to confirm and insert. Escape cancels an active session. A hold-to-talk mode (hold to listen, release to confirm) is available in `Settings > Voice`. Requires macOS 14 or later (best on macOS 26+ with on-device Apple SpeechAnalyzer; earlier versions use SFSpeechRecognizer, on-device when the locale supports it). Optional AI cleanup (fillers, punctuation, homophones, dictionary) goes through the Cloud Run proxy (Claude `claude-haiku-5-5` by default). Only when no proxy is configured does it call Gemini directly with the Gemini API key from Settings (`gemini-3.8-flash` by default); with neither, the raw transcript is kept. Only text is sent for cleanup, never audio. After cleanup, Restore (`Command + Shift + U`) reverts the last cleanup for 60 seconds, then falls back to the previous rewritten draft.
+Press the shortcut once to start listening and press it again to confirm and insert. Escape cancels an active session. A hold-to-talk mode (hold to listen, release to confirm) is available in `Settings > Voice`. Requires macOS 14 or later (best on macOS 26+ with on-device Apple SpeechAnalyzer; earlier versions use SFSpeechRecognizer, on-device when the locale supports it). Optional AI cleanup (fillers, punctuation, homophones, dictionary) calls the Claude API directly (`claude-haiku-5-5`) when a Claude API key is set in Settings; otherwise it goes through the Cloud Run proxy (migration-period compatibility). Only when neither is configured does it call Gemini directly with the Gemini API key from Settings; with none of them, the raw transcript is kept. Only text is sent for cleanup, never audio. After cleanup, Restore (`Command + Shift + U`) reverts the last cleanup for 60 seconds, then falls back to the previous rewritten draft.
 
 To restore the previous draft after a replacement:
 
@@ -204,11 +214,13 @@ If anything feels inactive, run:
 ResponseAi > Run Readiness Check
 ```
 
-The check shows whether Accessibility and Input Monitoring are active, whether Screen Recording is available for browser context OCR, whether the Cloud Run proxy health endpoint responds, whether the local writing profile is enabled, whether voice input is ready, and which hotkeys are active.
+The check shows whether Accessibility and Input Monitoring are active, whether Screen Recording is available for browser context OCR, which AI route is active, whether the Claude API key is accepted (`GET /v1/models`, no tokens used), whether the Cloud Run proxy health endpoint responds (informational only while a Claude API key is set), whether the local writing profile is enabled, whether voice input is ready, and which hotkeys are active.
 
 ## AI backend config
 
-The preferred path is the Cloud Run proxy. It keeps AI credentials and model selection off the Mac app, so every installed app uses the same centrally configured AI backend. By default the proxy calls the Claude API with `claude-haiku-5-5`; set `RESAI_AI_PROVIDER=vertex` when deploying to roll back to Vertex AI Gemini.
+For internal use, the preferred path is each user's own Claude API key entered in `設定 > AI接続` (see above). The app then calls `https://api.anthropic.com/v1/messages` directly with `claude-haiku-5-5`; the model is fixed in code and sampling parameters such as `temperature` are never sent.
+
+The Cloud Run proxy below is kept only for compatibility during the migration period and is used only when no Claude API key is set. It will be removed in a later change. By default the proxy calls the Claude API with `claude-haiku-5-5`; set `RESAI_AI_PROVIDER=vertex` when deploying to roll back to Vertex AI Gemini.
 
 Deploy or update the proxy:
 
@@ -288,7 +300,7 @@ RESAI_DISABLE_BUNDLED_PROXY=1 ./scripts/run_app.sh
 - one-command release verification script
 - one-command release build with optional pkg/dmg notarization
 - Global hotkey
-- Voice input on macOS 14+ (SpeechAnalyzer on macOS 26+, SFSpeechRecognizer fallback earlier; press to start / press to confirm, optional hold-to-talk, Escape to cancel, on-device transcription plus optional AI cleanup via the Cloud Run proxy, Gemini API key fallback)
+- Voice input on macOS 14+ (SpeechAnalyzer on macOS 26+, SFSpeechRecognizer fallback earlier; press to start / press to confirm, optional hold-to-talk, Escape to cancel, on-device transcription plus optional AI cleanup via the Claude API directly, the Cloud Run proxy during migration, or a Gemini API key fallback)
 - Restore-last-draft hotkey (also reverts the last voice cleanup within 60 seconds)
 - Profile-based form-fill hotkey with preview-before-fill confirmation
 - Configurable Command+Shift shortcut keys for Rewrite, Restore, and Form Fill
@@ -303,8 +315,9 @@ RESAI_DISABLE_BUNDLED_PROXY=1 ./scripts/run_app.sh
 - Sensitive-field and already-filled-field skipping for password, payment, authentication, and consent-like form inputs
 - Context capture diagnostics in the HUD, including AX/OCR source labels
 - Slack, browser, email, Discord, Teams, and LINE extraction profiles
+- Direct Claude API client (`claude-haiku-5-5`) with the user's own key stored in the Keychain
 - Vertex AI Gemini `generateContent` request builder
-- Cloud Run proxy with shared-secret protection and centrally owned provider/model config (Claude API by default, Vertex AI rollback)
+- Cloud Run proxy with shared-secret protection and centrally owned provider/model config (migration-period compatibility; Claude API by default, Vertex AI rollback)
 - Input replacement through Accessibility, with clipboard paste fallback
 - Replacement verification; if insertion cannot be verified, generated text remains copied for manual paste
 - Browser paste focusing via input-frame click before clipboard fallback

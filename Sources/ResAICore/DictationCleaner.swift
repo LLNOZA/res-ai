@@ -152,7 +152,7 @@ public final class GeminiDictationCleaner: DictationCleaning {
         let textRequest = GeminiTextRequest(
             systemInstruction: promptBuilder.systemInstruction(style: request.style),
             userPrompt: promptBuilder.userPrompt(for: request),
-            maxOutputTokens: maxOutputTokens(for: rawText),
+            maxOutputTokens: DictationCleanupTokenBudget.maxOutputTokens(for: rawText),
             temperature: 0.1
         )
         let rawOutput = try await client.generateText(textRequest, timeout: timeout)
@@ -162,11 +162,13 @@ public final class GeminiDictationCleaner: DictationCleaning {
         }
         return sanitized
     }
+}
 
+enum DictationCleanupTokenBudget {
     /// Output length is bounded by `validate`, not by this ceiling. Keep it generous so a
     /// thinking model that ignores `thinkingBudget: 0` cannot spend the whole budget on
     /// thoughts and return an empty answer (MAX_TOKENS).
-    private func maxOutputTokens(for rawText: String) -> Int {
+    static func maxOutputTokens(for rawText: String) -> Int {
         min(4096, max(1024, rawText.utf16.count * 4 + 256))
     }
 }
@@ -231,41 +233,92 @@ public final class ProxyDictationCleaner: DictationCleaning {
     }
 }
 
+/// Sends cleanup straight to the Claude API with the user's own key. Only text is sent.
+public final class ClaudeDictationCleaner: DictationCleaning {
+    private let client: ClaudeAPIClient
+    private let promptBuilder: DictationCleanupPromptBuilder
+
+    public init(client: ClaudeAPIClient, promptBuilder: DictationCleanupPromptBuilder = .init()) {
+        self.client = client
+        self.promptBuilder = promptBuilder
+    }
+
+    public func cleanup(_ request: DictationCleanupRequest, timeout: TimeInterval) async throws -> String {
+        let rawText = request.rawText
+        let rawOutput = try await client.generateText(
+            systemInstruction: promptBuilder.systemInstruction(style: request.style),
+            userPrompt: promptBuilder.userPrompt(for: request),
+            maxTokens: DictationCleanupTokenBudget.maxOutputTokens(for: rawText),
+            timeout: timeout
+        )
+        let sanitized = GeneratedReplySanitizer.sanitize(rawOutput)
+        if let reason = DictationCleanupOutputValidator.rejectionReason(sanitized, rawText: rawText) {
+            throw DictationCleanupError.rejectedOutput(reason: reason)
+        }
+        return sanitized
+    }
+}
+
 public enum DictationCleanupRoute: Equatable, Sendable {
+    case claude
     case proxy
     case gemini
     case none
 
-    /// The proxy wins whenever it is configured; a Gemini API key is only a fallback.
-    public static func select(proxyConfigured: Bool, hasGeminiKey: Bool) -> DictationCleanupRoute {
+    /// A Claude API key wins, then the proxy (kept for the migration period); a Gemini API key
+    /// is only a last fallback.
+    public static func select(
+        hasClaudeKey: Bool = false,
+        proxyConfigured: Bool,
+        hasGeminiKey: Bool
+    ) -> DictationCleanupRoute {
+        if hasClaudeKey {
+            return .claude
+        }
         if proxyConfigured {
             return .proxy
         }
         return hasGeminiKey ? .gemini : .none
     }
 
-    public static func select(config: VertexAIConfig, hasGeminiKey: Bool) -> DictationCleanupRoute {
-        select(proxyConfigured: config.proxyURL != nil, hasGeminiKey: hasGeminiKey)
+    public static func select(
+        config: VertexAIConfig,
+        hasClaudeKey: Bool = false,
+        hasGeminiKey: Bool
+    ) -> DictationCleanupRoute {
+        select(hasClaudeKey: hasClaudeKey, proxyConfigured: config.proxyURL != nil, hasGeminiKey: hasGeminiKey)
     }
 }
 
 public final class DictationCleanupRouter: DictationCleaning {
     public let route: DictationCleanupRoute
+    private let claudeCleaner: (any DictationCleaning)?
     private let proxyCleaner: any DictationCleaning
     private let geminiCleaner: (any DictationCleaning)?
 
     public init(
         config: VertexAIConfig,
+        claudeCleaner: (any DictationCleaning)? = nil,
         proxyCleaner: any DictationCleaning,
         geminiCleaner: (any DictationCleaning)?
     ) {
-        self.route = .select(config: config, hasGeminiKey: geminiCleaner != nil)
+        self.route = .select(
+            config: config,
+            hasClaudeKey: claudeCleaner != nil,
+            hasGeminiKey: geminiCleaner != nil
+        )
+        self.claudeCleaner = claudeCleaner
         self.proxyCleaner = proxyCleaner
         self.geminiCleaner = geminiCleaner
     }
 
     public func cleanup(_ request: DictationCleanupRequest, timeout: TimeInterval) async throws -> String {
         switch route {
+        case .claude:
+            guard let claudeCleaner else {
+                throw DictationCleanupError.notConfigured
+            }
+            return try await claudeCleaner.cleanup(request, timeout: timeout)
         case .proxy:
             return try await proxyCleaner.cleanup(request, timeout: timeout)
         case .gemini:

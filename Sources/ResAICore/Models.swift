@@ -337,6 +337,7 @@ public struct RewriteResult: Equatable {
 
 public enum RewriteSource: String, Equatable {
     case vertexAI
+    case claudeAPI
     case cloudRunProxy
     case localPreview
 }
