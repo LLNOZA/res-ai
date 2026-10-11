@@ -28,7 +28,7 @@ let package = Package(
         ),
         .testTarget(
             name: "ResponseAiTests",
-            dependencies: ["ResponseAi"],
+            dependencies: ["ResponseAi", "ResAICore"],
             path: "Tests/ResponseAiTests"
         )
     ]

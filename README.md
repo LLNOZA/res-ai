@@ -7,10 +7,10 @@ The app runs as a menu bar utility. Press the global hotkey while a reply box is
 1. Reads the focused input field through macOS Accessibility.
 2. Collects nearby text above the input field as conversation context.
 3. Builds a context-aware rewrite prompt with a configurable output language.
-4. Sends the prompt to Vertex AI Gemini when credentials are configured.
+4. Sends the prompt through the Cloud Run proxy to the Claude API (`claude-haiku-5-5` by default; `AI_PROVIDER=vertex` switches the proxy back to Vertex AI Gemini).
 5. Replaces the focused input text with the generated reply.
 
-If Vertex AI credentials are not configured yet, the app uses a local preview rewriter so the native flow can be tested before auth is wired.
+If the proxy or Vertex AI credentials are not configured yet, the app uses a local preview rewriter so the native flow can be tested before auth is wired.
 
 ## Public Repository Publication Gate
 
@@ -101,11 +101,13 @@ Build both release artifacts:
 The generated installers are written to:
 
 ```text
-dist/installer/ResponseAi-0.3.6.pkg
-dist/installer/ResponseAi-0.3.6.dmg
+dist/installer/ResponseAi-0.3.8.pkg
+dist/installer/ResponseAi-0.3.8.dmg
 ```
 
 If a `Developer ID Application` certificate is installed, `scripts/build_app.sh` uses it for the app bundle and `scripts/build_dmg.sh` signs the DMG. If a `Developer ID Installer` certificate is installed, `scripts/build_pkg.sh` signs the installer package. Without those certificates, the scripts still build unsigned local-testing installers.
+
+Set `RESAI_CODESIGN_IDENTITY` explicitly for every release. Keeping the same bundle ID and signing identity across releases prevents macOS from treating an update as a different app and discarding its Accessibility or Input Monitoring grants. Development builds may select a sole installed identity automatically, but stop and require an explicit choice when multiple matching identities are installed.
 
 For public distribution outside the Mac App Store, notarize and staple the signed artifacts:
 
@@ -128,13 +130,17 @@ RESAI_NOTARIZE=1 \
 You can also notarize one artifact directly:
 
 ```bash
-./scripts/notarize_pkg.sh dist/installer/ResponseAi-0.3.6.pkg
-./scripts/notarize_dmg.sh dist/installer/ResponseAi-0.3.6.dmg
+./scripts/notarize_pkg.sh dist/installer/ResponseAi-0.3.8.pkg
+./scripts/notarize_dmg.sh dist/installer/ResponseAi-0.3.8.dmg
 ```
 
-On first app run, grant Accessibility permission to `ResponseAi`:
+On first app run, use `ResponseAi > アクセシビリティ／入力監視を開く` (or the `操作権限` button in Settings), then grant Accessibility and Input Monitoring permission to `ResponseAi`:
 
 `System Settings > Privacy & Security > Accessibility`
+
+`System Settings > Privacy & Security > Input Monitoring`
+
+ResponseAi never invokes the macOS permission prompts from launch, feature attempts, wake/unlock recovery, or background monitoring. Permission requests happen only after the user explicitly selects the permission command. The app passively observes the resulting state, waits to register global shortcuts until both permissions are available, and then retries automatically. If macOS asks you to quit and reopen the app after enabling Input Monitoring, restart ResponseAi from its menu.
 
 For browser apps such as Facebook Messenger, Gmail, and other web messengers, ResponseAi can optionally use visible text recognition to read context above the focused reply box. Grant Screen Recording permission when prompted, or from the menu:
 
@@ -172,7 +178,7 @@ Dictate into the focused field with:
 Command + Shift + Space
 ```
 
-Press the shortcut once to start listening and press it again to confirm and insert. Escape cancels an active session. A hold-to-talk mode (hold to listen, release to confirm) is available in `Settings > Voice`. Requires macOS 14 or later (best on macOS 26+ with on-device Apple SpeechAnalyzer; earlier versions use SFSpeechRecognizer, on-device when the locale supports it). Optional Gemini cleanup uses `gemini-3.8-flash` by default; set the API key in Settings. After cleanup, Restore (`Command + Shift + U`) reverts the last cleanup for 60 seconds, then falls back to the previous rewritten draft.
+Press the shortcut once to start listening and press it again to confirm and insert. Escape cancels an active session. A hold-to-talk mode (hold to listen, release to confirm) is available in `Settings > Voice`. Requires macOS 14 or later (best on macOS 26+ with on-device Apple SpeechAnalyzer; earlier versions use SFSpeechRecognizer, on-device when the locale supports it). Optional AI cleanup (fillers, punctuation, homophones, dictionary) goes through the Cloud Run proxy (Claude `claude-haiku-5-5` by default). Only when no proxy is configured does it call Gemini directly with the Gemini API key from Settings (`gemini-3.8-flash` by default); with neither, the raw transcript is kept. Only text is sent for cleanup, never audio. After cleanup, Restore (`Command + Shift + U`) reverts the last cleanup for 60 seconds, then falls back to the previous rewritten draft.
 
 To restore the previous draft after a replacement:
 
@@ -198,11 +204,11 @@ If anything feels inactive, run:
 ResponseAi > Run Readiness Check
 ```
 
-The check shows whether Accessibility is active, whether Screen Recording is available for browser context OCR, whether the Cloud Run proxy health endpoint responds, whether the local writing profile is enabled, whether voice input is ready, and which hotkeys are active.
+The check shows whether Accessibility and Input Monitoring are active, whether Screen Recording is available for browser context OCR, whether the Cloud Run proxy health endpoint responds, whether the local writing profile is enabled, whether voice input is ready, and which hotkeys are active.
 
-## Vertex AI config
+## AI backend config
 
-The preferred path is the Cloud Run proxy. It keeps Vertex AI credentials and model selection off the Mac app, so every installed app uses the same centrally configured AI backend.
+The preferred path is the Cloud Run proxy. It keeps AI credentials and model selection off the Mac app, so every installed app uses the same centrally configured AI backend. By default the proxy calls the Claude API with `claude-haiku-5-5`; set `RESAI_AI_PROVIDER=vertex` when deploying to roll back to Vertex AI Gemini.
 
 Deploy or update the proxy:
 
@@ -217,6 +223,15 @@ RESAI_CLOUD_RUN_SERVICE=<your-cloud-run-service>
 RESAI_CLOUD_RUN_SA=<your-service-account-name>
 RESAI_PROXY_SECRET_NAME=<your-secret-manager-secret>
 RESAI_CLOUD_RUN_REGION=<your-cloud-run-region>
+RESAI_AI_PROVIDER=anthropic                         # or vertex
+RESAI_ANTHROPIC_MODEL=claude-haiku-5-5
+RESAI_ANTHROPIC_SECRET_NAME=resai-anthropic-api-key # Secret Manager secret holding the Anthropic API key
+```
+
+With `RESAI_AI_PROVIDER=anthropic`, register the Anthropic API key in Secret Manager before deploying; the script never creates or prints it:
+
+```bash
+gcloud secrets create resai-anthropic-api-key --project <your-gcp-project-id> --replication-policy=automatic --data-file=-
 ```
 
 To preview what it would do without creating or updating resources:
@@ -245,9 +260,12 @@ RESAI_VERTEX_PROXY_URL=<your-cloud-run-url>/v1/rewrite
 
 Clipboard history excludes concealed, transient, and autogenerated pasteboard items, preserves whitespace, skips oversized text rather than truncating it, and expires entries after seven days. History still uses local UserDefaults storage; disable it when persistent clipboard storage is inappropriate.
 
-Model, project, and location are common settings owned by Cloud Run:
+Provider, model, project, and location are common settings owned by Cloud Run:
 
 ```text
+AI_PROVIDER
+ANTHROPIC_MODEL
+ANTHROPIC_API_KEY (from Secret Manager)
 VERTEX_PROJECT_ID
 VERTEX_LOCATION
 VERTEX_MODEL
@@ -270,7 +288,7 @@ RESAI_DISABLE_BUNDLED_PROXY=1 ./scripts/run_app.sh
 - one-command release verification script
 - one-command release build with optional pkg/dmg notarization
 - Global hotkey
-- Voice input on macOS 14+ (SpeechAnalyzer on macOS 26+, SFSpeechRecognizer fallback earlier; press to start / press to confirm, optional hold-to-talk, Escape to cancel, on-device transcription plus optional Gemini cleanup)
+- Voice input on macOS 14+ (SpeechAnalyzer on macOS 26+, SFSpeechRecognizer fallback earlier; press to start / press to confirm, optional hold-to-talk, Escape to cancel, on-device transcription plus optional AI cleanup via the Cloud Run proxy, Gemini API key fallback)
 - Restore-last-draft hotkey (also reverts the last voice cleanup within 60 seconds)
 - Profile-based form-fill hotkey with preview-before-fill confirmation
 - Configurable Command+Shift shortcut keys for Rewrite, Restore, and Form Fill
@@ -286,7 +304,7 @@ RESAI_DISABLE_BUNDLED_PROXY=1 ./scripts/run_app.sh
 - Context capture diagnostics in the HUD, including AX/OCR source labels
 - Slack, browser, email, Discord, Teams, and LINE extraction profiles
 - Vertex AI Gemini `generateContent` request builder
-- Cloud Run Vertex proxy with shared-secret protection and centrally owned model config
+- Cloud Run proxy with shared-secret protection and centrally owned provider/model config (Claude API by default, Vertex AI rollback)
 - Input replacement through Accessibility, with clipboard paste fallback
 - Replacement verification; if insertion cannot be verified, generated text remains copied for manual paste
 - Browser paste focusing via input-frame click before clipboard fallback

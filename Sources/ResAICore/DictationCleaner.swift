@@ -157,7 +157,9 @@ public final class GeminiDictationCleaner: DictationCleaning {
         )
         let rawOutput = try await client.generateText(textRequest, timeout: timeout)
         let sanitized = GeneratedReplySanitizer.sanitize(rawOutput)
-        try validate(sanitized, rawText: rawText, style: request.style)
+        if let reason = DictationCleanupOutputValidator.rejectionReason(sanitized, rawText: rawText) {
+            throw GeminiAPIError.rejectedOutput(reason: reason)
+        }
         return sanitized
     }
 
@@ -167,21 +169,112 @@ public final class GeminiDictationCleaner: DictationCleaning {
     private func maxOutputTokens(for rawText: String) -> Int {
         min(4096, max(1024, rawText.utf16.count * 4 + 256))
     }
+}
 
-    private func validate(_ text: String, rawText: String, style: DictationCleanupStyle) throws {
+public enum DictationCleanupError: LocalizedError, Equatable {
+    case notConfigured
+    case rejectedOutput(reason: String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .notConfigured:
+            "Dictation cleanup is not configured."
+        case let .rejectedOutput(reason):
+            "Cleanup output rejected: \(NetworkRequestSafety.safeBody(reason, limit: 160))."
+        }
+    }
+}
+
+enum DictationCleanupOutputValidator {
+    static func rejectionReason(_ text: String, rawText: String) -> String? {
         let rawCount = rawText.utf16.count
         let outCount = text.utf16.count
         if text.isEmpty {
-            throw GeminiAPIError.rejectedOutput(reason: "empty after sanitize")
+            return "empty after sanitize"
         }
         if outCount > Int(Double(rawCount) * 2.5) + 20 {
-            throw GeminiAPIError.rejectedOutput(reason: "too long raw=\(rawCount) out=\(outCount)")
+            return "too long raw=\(rawCount) out=\(outCount)"
         }
         // 重複・言い直しが多い発話は半分以下に縮むことがあるため、下限はゆるめにしておく。
         // 文章化モードでも「要約しない」が方針なので、極端に縮んだ出力は丸めすぎとみなして捨てる。
         let floor = 0.2
         if rawCount > 0 && Double(outCount) < Double(rawCount) * floor {
-            throw GeminiAPIError.rejectedOutput(reason: "too short raw=\(rawCount) out=\(outCount)")
+            return "too short raw=\(rawCount) out=\(outCount)"
+        }
+        return nil
+    }
+}
+
+/// Sends cleanup through the Cloud Run proxy using the same `{systemInstruction, userPrompt}`
+/// contract as reply rewriting. Only text is sent; audio never leaves the Mac.
+public final class ProxyDictationCleaner: DictationCleaning {
+    private let client: CloudRunProxyClient
+    private let promptBuilder: DictationCleanupPromptBuilder
+
+    public init(client: CloudRunProxyClient, promptBuilder: DictationCleanupPromptBuilder = .init()) {
+        self.client = client
+        self.promptBuilder = promptBuilder
+    }
+
+    public func cleanup(_ request: DictationCleanupRequest, timeout: TimeInterval) async throws -> String {
+        let rawText = request.rawText
+        let rawOutput = try await client.generateText(
+            systemInstruction: promptBuilder.systemInstruction(style: request.style),
+            userPrompt: promptBuilder.userPrompt(for: request),
+            timeout: timeout
+        )
+        let sanitized = GeneratedReplySanitizer.sanitize(rawOutput)
+        if let reason = DictationCleanupOutputValidator.rejectionReason(sanitized, rawText: rawText) {
+            throw DictationCleanupError.rejectedOutput(reason: reason)
+        }
+        return sanitized
+    }
+}
+
+public enum DictationCleanupRoute: Equatable, Sendable {
+    case proxy
+    case gemini
+    case none
+
+    /// The proxy wins whenever it is configured; a Gemini API key is only a fallback.
+    public static func select(proxyConfigured: Bool, hasGeminiKey: Bool) -> DictationCleanupRoute {
+        if proxyConfigured {
+            return .proxy
+        }
+        return hasGeminiKey ? .gemini : .none
+    }
+
+    public static func select(config: VertexAIConfig, hasGeminiKey: Bool) -> DictationCleanupRoute {
+        select(proxyConfigured: config.proxyURL != nil, hasGeminiKey: hasGeminiKey)
+    }
+}
+
+public final class DictationCleanupRouter: DictationCleaning {
+    public let route: DictationCleanupRoute
+    private let proxyCleaner: any DictationCleaning
+    private let geminiCleaner: (any DictationCleaning)?
+
+    public init(
+        config: VertexAIConfig,
+        proxyCleaner: any DictationCleaning,
+        geminiCleaner: (any DictationCleaning)?
+    ) {
+        self.route = .select(config: config, hasGeminiKey: geminiCleaner != nil)
+        self.proxyCleaner = proxyCleaner
+        self.geminiCleaner = geminiCleaner
+    }
+
+    public func cleanup(_ request: DictationCleanupRequest, timeout: TimeInterval) async throws -> String {
+        switch route {
+        case .proxy:
+            return try await proxyCleaner.cleanup(request, timeout: timeout)
+        case .gemini:
+            guard let geminiCleaner else {
+                throw DictationCleanupError.notConfigured
+            }
+            return try await geminiCleaner.cleanup(request, timeout: timeout)
+        case .none:
+            throw DictationCleanupError.notConfigured
         }
     }
 }

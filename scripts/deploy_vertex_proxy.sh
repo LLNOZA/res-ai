@@ -8,6 +8,9 @@ PROJECT_NUMBER="${RESAI_GCP_PROJECT_NUMBER:?Set RESAI_GCP_PROJECT_NUMBER to your
 REGION="${RESAI_CLOUD_RUN_REGION:-asia-northeast1}"
 VERTEX_LOCATION="${RESAI_VERTEX_LOCATION:-global}"
 VERTEX_MODEL="${RESAI_VERTEX_MODEL:-gemini-3.5-flash}"
+AI_PROVIDER="${RESAI_AI_PROVIDER:-anthropic}"
+ANTHROPIC_MODEL="${RESAI_ANTHROPIC_MODEL:-claude-haiku-5-5}"
+ANTHROPIC_SECRET_NAME="${RESAI_ANTHROPIC_SECRET_NAME:-resai-anthropic-api-key}"
 SERVICE_NAME="${RESAI_CLOUD_RUN_SERVICE:?Set RESAI_CLOUD_RUN_SERVICE to your Cloud Run service name}"
 SERVICE_ACCOUNT_NAME="${RESAI_CLOUD_RUN_SA:?Set RESAI_CLOUD_RUN_SA to your service account name}"
 SECRET_NAME="${RESAI_PROXY_SECRET_NAME:?Set RESAI_PROXY_SECRET_NAME to your Secret Manager secret name}"
@@ -76,8 +79,9 @@ ensure_project_iam_binding() {
 }
 
 secret_binding_exists() {
-  local member="$1"
-  gcloud secrets get-iam-policy "$SECRET_NAME" \
+  local secret="$1"
+  local member="$2"
+  gcloud secrets get-iam-policy "$secret" \
     --project "$PROJECT_ID" \
     --flatten "bindings[].members" \
     --filter "bindings.role=roles/secretmanager.secretAccessor AND bindings.members=$member" \
@@ -85,19 +89,20 @@ secret_binding_exists() {
 }
 
 ensure_secret_accessor() {
-  local member="$1"
-  if ! gcloud secrets describe "$SECRET_NAME" --project "$PROJECT_ID" >/dev/null 2>&1; then
+  local secret="$1"
+  local member="$2"
+  if ! gcloud secrets describe "$secret" --project "$PROJECT_ID" >/dev/null 2>&1; then
     if [[ "$DRY_RUN" == "1" ]]; then
-      echo "[dry-run] Secret accessor binding would be added after secret creation: $member"
+      echo "[dry-run] Secret accessor binding would be added after secret creation: $secret $member"
       return
     fi
   fi
 
-  if secret_binding_exists "$member"; then
-    echo "Secret accessor binding already exists: $member"
+  if secret_binding_exists "$secret" "$member"; then
+    echo "Secret accessor binding already exists: $secret $member"
   else
-    echo "Adding secret accessor binding: $member"
-    run gcloud secrets add-iam-policy-binding "$SECRET_NAME" \
+    echo "Adding secret accessor binding: $secret $member"
+    run gcloud secrets add-iam-policy-binding "$secret" \
       --project "$PROJECT_ID" \
       --member "$member" \
       --role "roles/secretmanager.secretAccessor" \
@@ -142,6 +147,27 @@ ensure_secret() {
   fi
 }
 
+ensure_anthropic_secret() {
+  # The Anthropic API key is registered by the operator; never create or print it here.
+  if gcloud secrets describe "$ANTHROPIC_SECRET_NAME" --project "$PROJECT_ID" >/dev/null 2>&1; then
+    echo "Secret already exists: $ANTHROPIC_SECRET_NAME"
+  elif [[ "$DRY_RUN" == "1" ]]; then
+    echo "[dry-run] Secret must be created before deploy: $ANTHROPIC_SECRET_NAME"
+  else
+    echo "Missing Secret Manager secret: $ANTHROPIC_SECRET_NAME" >&2
+    echo "Create it first, e.g.: gcloud secrets create $ANTHROPIC_SECRET_NAME --project $PROJECT_ID --data-file=-" >&2
+    exit 1
+  fi
+}
+
+case "$AI_PROVIDER" in
+  anthropic|vertex) ;;
+  *)
+    echo "Unsupported RESAI_AI_PROVIDER: $AI_PROVIDER (use anthropic or vertex)" >&2
+    exit 1
+    ;;
+esac
+
 need_command gcloud
 need_command openssl
 
@@ -149,6 +175,7 @@ echo "Target project: $PROJECT_ID ($PROJECT_NUMBER)"
 echo "Cloud Run service: $SERVICE_NAME / $REGION"
 echo "Service account: $SERVICE_ACCOUNT_EMAIL"
 echo "Secret: $SECRET_NAME"
+echo "AI provider: $AI_PROVIDER"
 
 run gcloud config set project "$PROJECT_ID" >/dev/null
 
@@ -169,7 +196,14 @@ fi
 
 ensure_project_iam_binding "roles/aiplatform.user" "serviceAccount:${SERVICE_ACCOUNT_EMAIL}"
 ensure_secret
-ensure_secret_accessor "serviceAccount:${SERVICE_ACCOUNT_EMAIL}"
+ensure_secret_accessor "$SECRET_NAME" "serviceAccount:${SERVICE_ACCOUNT_EMAIL}"
+
+SECRETS_SPEC="RESAI_PROXY_SHARED_SECRET=${SECRET_NAME}:latest"
+if [[ "$AI_PROVIDER" == "anthropic" ]]; then
+  ensure_anthropic_secret
+  ensure_secret_accessor "$ANTHROPIC_SECRET_NAME" "serviceAccount:${SERVICE_ACCOUNT_EMAIL}"
+  SECRETS_SPEC="${SECRETS_SPEC},ANTHROPIC_API_KEY=${ANTHROPIC_SECRET_NAME}:latest"
+fi
 
 DEPLOY_ARGS=(
   run deploy "$SERVICE_NAME"
@@ -182,8 +216,8 @@ DEPLOY_ARGS=(
   --max-instances "2"
   --memory "256Mi"
   --cpu "1"
-  --set-env-vars "VERTEX_PROJECT_ID=${PROJECT_ID},VERTEX_LOCATION=${VERTEX_LOCATION},VERTEX_MODEL=${VERTEX_MODEL}"
-  --set-secrets "RESAI_PROXY_SHARED_SECRET=${SECRET_NAME}:latest"
+  --set-env-vars "AI_PROVIDER=${AI_PROVIDER},ANTHROPIC_MODEL=${ANTHROPIC_MODEL},VERTEX_PROJECT_ID=${PROJECT_ID},VERTEX_LOCATION=${VERTEX_LOCATION},VERTEX_MODEL=${VERTEX_MODEL}"
+  --set-secrets "$SECRETS_SPEC"
   --quiet
 )
 

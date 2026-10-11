@@ -10,11 +10,11 @@ public enum HotKeyError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .eventTapCreateFailed:
-            "Failed to create keyboard event tap. Check Accessibility/Input Monitoring permissions."
+            "キーボード監視を開始できませんでした。アクセシビリティと入力監視を確認し、ResponseAiを再起動してください。"
         case .runLoopSourceCreateFailed:
-            "Failed to create keyboard event tap run loop source."
+            "キーボード監視の実行元を作成できませんでした。ResponseAiを再起動してください。"
         case .eventTapRunLoopUnavailable:
-            "The keyboard event tap thread did not respond in time. Try Repair Shortcuts or check Accessibility/Input Monitoring permissions."
+            "キーボード監視が応答しませんでした。「ショートカットを修復」を実行してください。"
         }
     }
 }

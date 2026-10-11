@@ -48,6 +48,34 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 400, { error: "systemInstruction and userPrompt are required" });
     }
 
+    const provider = (env.AI_PROVIDER || "anthropic").trim().toLowerCase();
+    if (provider === "anthropic") {
+      const apiKey = env.ANTHROPIC_API_KEY || "";
+      const model = env.ANTHROPIC_MODEL || "claude-haiku-5-5";
+      if (!apiKey.trim()) {
+        return sendJSON(res, 500, { error: "ANTHROPIC_API_KEY is not configured" });
+      }
+
+      const anthropicResponse = await callAnthropic({
+        apiKey: apiKey.trim(),
+        model,
+        systemInstruction,
+        userPrompt,
+        fetchImpl,
+        signal: controller.signal
+      });
+
+      return sendJSON(res, 200, {
+        text: sanitizeGeneratedText(anthropicResponse.text),
+        model,
+        location: "anthropic",
+        finishReason: "STOP"
+      });
+    }
+    if (provider !== "vertex") {
+      return sendJSON(res, 500, { error: "AI_PROVIDER is not supported" });
+    }
+
     const projectID = env.VERTEX_PROJECT_ID || env.GOOGLE_CLOUD_PROJECT;
     const location = env.VERTEX_LOCATION || "global";
     const model = env.VERTEX_MODEL || "gemini-3.5-flash";
@@ -243,6 +271,59 @@ async function callVertexAI({
 
   if (!text) {
     throw new Error("Vertex AI returned no text");
+  }
+
+  return { text: sanitizeGeneratedText(text) };
+}
+
+async function callAnthropic({
+  apiKey,
+  model,
+  systemInstruction,
+  userPrompt,
+  fetchImpl,
+  signal
+}) {
+  const response = await fetchImpl("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      signal,
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 4096,
+        // claude-haiku-5-5 rejects sampling parameters such as temperature (HTTP 400).
+        system: systemInstruction,
+        messages: [
+          { role: "user", content: userPrompt }
+        ]
+      })
+    });
+
+  const payloadText = await response.text();
+  if (!response.ok) {
+    const error = new Error(`Anthropic API failed: HTTP ${response.status}`);
+    error.statusCode = 502;
+    throw error;
+  }
+
+  const payload = JSON.parse(payloadText);
+  if (payload?.stop_reason !== "end_turn" && payload?.stop_reason !== "stop_sequence") {
+    throw Object.assign(new Error("incomplete model response"), { statusCode: 502 });
+  }
+  const text = Array.isArray(payload?.content)
+    ? payload.content
+      .filter((block) => block?.type === "text" && typeof block.text === "string")
+      .map((block) => block.text)
+      .join("\n")
+      .trim()
+    : "";
+
+  if (!text) {
+    throw Object.assign(new Error("Anthropic API returned no text"), { statusCode: 502 });
   }
 
   return { text: sanitizeGeneratedText(text) };

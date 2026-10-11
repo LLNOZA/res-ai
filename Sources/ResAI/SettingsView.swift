@@ -66,9 +66,9 @@ struct SettingsView: View {
                 }
                     .keyboardShortcut(.defaultAction)
                 Button {
-                    controller.requestAccessibilityPermission()
+                    controller.requestHotKeyPermissionsFromUserAction()
                 } label: {
-                    Label("アクセシビリティ", systemImage: "hand.raised")
+                    Label("操作権限", systemImage: "hand.raised")
                 }
                 Button {
                     controller.requestScreenRecordingPermission()
@@ -134,7 +134,7 @@ struct SettingsView: View {
             }
             .pickerStyle(.segmented)
 
-            Toggle("Gemini で整える", isOn: $voiceInput.settings.cleanupEnabled)
+            Toggle("AI で整える", isOn: $voiceInput.settings.cleanupEnabled)
                 .help("入力は先に生テキストで行い、整った文が返ってきたら自分が入れた部分だけ差し替えます。オフなら端末内だけで完結します。")
 
             if voiceInput.settings.cleanupEnabled {
@@ -172,7 +172,7 @@ struct SettingsView: View {
                     }
                 }
                 GridRow {
-                    Text("モデル")
+                    Text("Gemini モデル")
                         .foregroundStyle(.secondary)
                     TextField("gemini-3.8-flash", text: $voiceInput.settings.geminiModel)
                         .textFieldStyle(.roundedBorder)
@@ -190,13 +190,18 @@ struct SettingsView: View {
                 }
             }
 
+            Text(cleanupRouteNote)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
             Toggle("入力欄の上の文脈を整えの参考に送る", isOn: $voiceInput.settings.includeScreenContext)
                 .help("同音異義語の判断のために、入力欄の上に見えている数行をテキストで送ります。音声は送りません。")
 
             HStack(spacing: 8) {
                 Button {
                     voiceInput.saveSettings()
-                    voiceInput.testGeminiConnection()
+                    voiceInput.testCleanupConnection()
                 } label: {
                     Label("接続テスト", systemImage: "antenna.radiowaves.left.and.right")
                 }
@@ -216,6 +221,13 @@ struct SettingsView: View {
 
             dictionaryEditor
         }
+    }
+
+    private var cleanupRouteNote: String {
+        if controller.config.proxyURL != nil {
+            return "整えは AIプロキシ経由で行います。Gemini APIキーとモデルはプロキシ未設定時のみ使用します。"
+        }
+        return "AIプロキシが未設定のため、整えは Gemini APIキーで直接行います（キーが空なら整えずに生テキストのまま）。"
     }
 
     private var voiceHelpText: String {

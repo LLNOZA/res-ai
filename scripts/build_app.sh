@@ -12,6 +12,37 @@ LEGACY_APP_DIR="$ROOT_DIR/dist/ResAI.app"
 
 cd "$ROOT_DIR"
 
+SIGN_IDENTITY="${RESAI_CODESIGN_IDENTITY:-}"
+if command -v codesign >/dev/null 2>&1 \
+  && [[ -z "$SIGN_IDENTITY" ]] \
+  && command -v security >/dev/null 2>&1; then
+  DEVELOPER_ID_IDENTITIES="$(
+    security find-identity -v -p codesigning 2>/dev/null \
+      | awk -F '"' '/Developer ID Application:/ { print $2 }'
+  )"
+  DEVELOPER_ID_COUNT="$(printf '%s\n' "$DEVELOPER_ID_IDENTITIES" | awk 'NF { count++ } END { print count + 0 }')"
+  if [[ "$DEVELOPER_ID_COUNT" -gt 1 ]]; then
+    echo "Multiple Developer ID Application identities found. Set RESAI_CODESIGN_IDENTITY explicitly to keep the app identity stable." >&2
+    exit 1
+  elif [[ "$DEVELOPER_ID_COUNT" -eq 1 ]]; then
+    SIGN_IDENTITY="$(printf '%s\n' "$DEVELOPER_ID_IDENTITIES" | awk 'NF { print; exit }')"
+  fi
+
+  if [[ -z "$SIGN_IDENTITY" ]]; then
+    APPLE_DEVELOPMENT_IDENTITIES="$(
+      security find-identity -v -p codesigning 2>/dev/null \
+        | awk -F '"' '/Apple Development:/ { print $2 }'
+    )"
+    APPLE_DEVELOPMENT_COUNT="$(printf '%s\n' "$APPLE_DEVELOPMENT_IDENTITIES" | awk 'NF { count++ } END { print count + 0 }')"
+    if [[ "$APPLE_DEVELOPMENT_COUNT" -gt 1 ]]; then
+      echo "Multiple Apple Development identities found. Set RESAI_CODESIGN_IDENTITY explicitly to keep Accessibility and Input Monitoring grants stable across updates." >&2
+      exit 1
+    elif [[ "$APPLE_DEVELOPMENT_COUNT" -eq 1 ]]; then
+      SIGN_IDENTITY="$(printf '%s\n' "$APPLE_DEVELOPMENT_IDENTITIES" | awk 'NF { print; exit }')"
+    fi
+  fi
+fi
+
 swift build -c release
 
 # Retain the unstripped executable and matching symbols for crash reports from
@@ -50,20 +81,6 @@ if command -v xcrun >/dev/null 2>&1; then
 fi
 
 if command -v codesign >/dev/null 2>&1; then
-  SIGN_IDENTITY="${RESAI_CODESIGN_IDENTITY:-}"
-  if [[ -z "$SIGN_IDENTITY" ]] && command -v security >/dev/null 2>&1; then
-    SIGN_IDENTITY="$(
-      security find-identity -v -p codesigning 2>/dev/null \
-        | awk -F '"' '/Developer ID Application:/ { print $2; exit }'
-    )"
-  fi
-  if [[ -z "$SIGN_IDENTITY" ]] && command -v security >/dev/null 2>&1; then
-    SIGN_IDENTITY="$(
-      security find-identity -v -p codesigning 2>/dev/null \
-        | awk -F '"' '/Apple Development:/ { print $2; exit }'
-    )"
-  fi
-
   # Hardened runtime blocks microphone access outright unless the audio-input
   # entitlement is present, so the entitlements file must accompany every signature.
   ENTITLEMENTS="$ROOT_DIR/packaging/ResponseAi.entitlements"
