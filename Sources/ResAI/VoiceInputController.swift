@@ -7,7 +7,13 @@ import ResAICore
 /// the Cloud Run proxy, else Gemini directly) swaps only the inserted text afterwards.
 @MainActor
 final class VoiceInputController: ObservableObject {
-    @Published var settings: VoiceInputSettings
+    @Published var settings: VoiceInputSettings {
+        didSet {
+            if settings.activationMode != oldValue.activationMode {
+                onActivationModeChange?(settings.activationMode)
+            }
+        }
+    }
     @Published var dictionary: UserDictionary
     @Published var geminiAPIKey: String
     @Published private(set) var isListening = false
@@ -16,6 +22,8 @@ final class VoiceInputController: ObservableObject {
     var onHUDMessage: ((HUDMessage) -> Void)?
     var onStatusChange: ((String) -> Void)?
     var onHideHUD: (() -> Void)?
+    /// Lets the hotkey tap switch a modifier-only trigger between hold and tap.
+    var onActivationModeChange: ((VoiceActivationMode) -> Void)?
     /// App-level work (rewrite/form/restore) can temporarily reserve the input
     /// surface.  The default keeps this controller usable in isolation/tests.
     var canStartSession: () -> Bool = { true }
@@ -137,6 +145,15 @@ final class VoiceInputController: ObservableObject {
         }
     }
 
+    /// Hold mode with a modifier-only trigger: an ordinary key arrived while the
+    /// trigger was held (⌘⇧T with ⌘⇧ registered). Drops the session this press
+    /// started without inserting text, closing the pill/HUD quietly.
+    func hotKeyCancelled() {
+        guard activation.handle(.cancelled) == .cancel else { return }
+        AppLog.write("voice hotkey cancelled by another key")
+        cancelActiveSession(showsHUD: false)
+    }
+
     func cancelListening() {
         cancelActiveSession()
     }
@@ -144,7 +161,7 @@ final class VoiceInputController: ObservableObject {
     /// Cancels both a listening session and a session whose engine is still
     /// preparing/finalizing.  Escape and app-level recovery use this entry point
     /// so an in-flight `start` cannot resurrect the microphone later.
-    func cancelActiveSession() {
+    func cancelActiveSession(showsHUD: Bool = true) {
         guard phase != .idle || activeSessionID != nil || cleanupSessionID != nil || engine.isRunning else {
             return
         }
@@ -166,7 +183,10 @@ final class VoiceInputController: ObservableObject {
         setListening(false)
         resetActivationToIdle()
         setStatus("Ready")
-        if hadSession {
+        if !showsHUD {
+            hidePill(animated: true)
+            onHideHUD?()
+        } else if hadSession {
             showHUD(HUDMessage(
                 title: "音声入力を中止しました",
                 tone: .idle,
@@ -914,6 +934,8 @@ final class VoiceInputController: ObservableObject {
             if phase == .listening {
                 stopListening()
             }
+        case .cancel:
+            cancelActiveSession(showsHUD: false)
         case .none:
             break
         }

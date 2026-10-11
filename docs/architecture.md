@@ -112,7 +112,7 @@ hotkey ──> SpeechAnalyzer (macOS 26+) or SFSpeechRecognizer (macOS 14/15)
       ──> TextReplacer.replaceInsertedText       (swap only the inserted range, skip if field changed)
 ```
 
-Default shortcut is `Command + Shift + Space`. Default mode is toggle: one press starts listening, the next press confirms. An optional hold mode (≥ 250 ms hold listens while held and confirms on release; a quicker tap falls back to toggle) can be selected in Settings. Escape cancels while listening. After cleanup, Restore (`Command + Shift + U`) reverts to the raw transcript for 60 seconds before falling through to rewrite-draft restore.
+Default shortcut is `Command + Shift + Space` (changeable in Settings, including modifier-only chords such as `fn + Command`). Default mode is toggle: one press starts listening, the next press confirms. An optional hold mode (≥ 250 ms hold listens while held and confirms on release; a quicker tap falls back to toggle) can be selected in Settings. Escape cancels while listening. After cleanup, Restore (`Command + Shift + U`) reverts to the raw transcript for 60 seconds before falling through to rewrite-draft restore.
 
 ### FormReader and FormFillPlanner
 
@@ -168,7 +168,14 @@ The user can enable or disable profile use per rewrite session from Settings. Th
 
 ### Shortcuts
 
-Rewrite, Restore, and Form Fill each use a global Command + Shift shortcut. Users can change the letter key in Settings. Shortcut settings are stored locally, sanitized to avoid duplicates, used by the menu key equivalents, and re-registered immediately when changed.
+Voice, Rewrite, Restore, Form Fill, and Quick Menu each use a global shortcut recorded in Settings (click the field, press the combination). A shortcut (`ShortcutTrigger`) is either a virtual key code plus any of Command / Option / Control / Shift, including none (`.key(HotKeyShortcut)`), or one or more modifiers alone including fn (`.modifierChord`). Key labels come from the current keyboard layout via `UCKeyTranslate`, so JIS keyboards show the printed key. Key shortcuts are swallowed by the event tap. Modifier-only chords are detected by `ModifierChordDetector` from `flagsChanged` without swallowing events:
+
+- `.tap` style (every action, and Voice in toggle mode): fires when the chord is let go, only if it was reached on its own (no other modifier on the way), no ordinary key or mouse click came while it was held, and it was held at most 0.6 seconds. Keys swallowed by another shortcut's tap are reported through a shared counter in `GlobalHotKeyManager`, so Command + Shift + J (taken by Rewrite) does not also fire a Command + Shift chord.
+- `.hold` style (Voice in hold-to-talk mode): press starts listening and release confirms; an ordinary key (or another modifier) while held emits `.cancelled`, which `GlobalHotKeyManager` delivers once to `onCancel` and `VoiceInputController.hotKeyCancelled()` turns into a quiet cancel (no text, pill/HUD closed). The voice manager's `modifierChordStyle` follows the activation mode.
+
+`AppShortcuts.validationError` refuses only duplicates between actions, an empty chord, and keys that cannot be recorded. `ShortcutTrigger.warning` classifies combinations that take something away (a key alone, Shift plus a character, the `ReservedShortcut.all` list of macOS / common app shortcuts, modifiers alone); Settings asks for confirmation before registering them and keeps the note under the row. While a field records, the event taps stay installed but pass every key through (`GlobalHotKeyManager.isSuspended`), so an already registered combination can be recorded again. If registration fails, the previous shortcuts are restored and the reason is shown under the row.
+
+Settings are stored in `shortcuts.v2` (`{"version":2,"rewrite":{"keyCode":38,"modifiers":["command","shift"]},…,"voice":{"type":"key"|"modifiers",…}}`). Non-voice actions keep the bare key shape and add `"type":"modifiers"` only for modifier-only chords; a missing `"type"` reads as a key. When `shortcuts.v2` has never been written, the 0.4.0 payload in `shortcuts.v1` (Command + Shift + letter, fn + Command, Command + Space) is converted to the same shortcuts; `shortcuts.v1` is left untouched. Unreadable data falls back to the defaults. Loaded settings are sanitized only for shape and duplicates, so a migrated reserved combination such as Command + Space keeps working.
 
 ### AI backend
 

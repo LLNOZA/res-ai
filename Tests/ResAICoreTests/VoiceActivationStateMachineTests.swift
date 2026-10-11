@@ -69,4 +69,30 @@ final class VoiceActivationStateMachineTests: XCTestCase {
         XCTAssertEqual(machine.handle(.keyUp(at: 1), mode: .holdOrTap), .confirm)
         XCTAssertEqual(machine.state, .finishing)
     }
+
+    func testCancelWhileHoldingDropsTheSessionWithoutConfirming() {
+        var machine = VoiceActivationStateMachine()
+
+        XCTAssertEqual(machine.handle(.keyDown(at: 0), mode: .holdOrTap), .startListening)
+        XCTAssertEqual(machine.handle(.cancelled, mode: .holdOrTap), .cancel)
+        XCTAssertEqual(machine.state, .idle)
+        // No release follows a cancel, but a stray one must not confirm.
+        XCTAssertEqual(machine.handle(.keyUp(at: 1), mode: .holdOrTap), .none)
+        XCTAssertEqual(machine.handle(.cancelled, mode: .holdOrTap), .none)
+        XCTAssertEqual(machine.handle(.keyDown(at: 2), mode: .holdOrTap), .startListening)
+    }
+
+    func testCancelOnlyAffectsThePressThatStartedTheSession() {
+        var machine = VoiceActivationStateMachine()
+
+        XCTAssertEqual(machine.handle(.keyDown(at: 0), mode: .holdOrTap), .startListening)
+        XCTAssertEqual(machine.handle(.keyUp(at: 0.1), mode: .holdOrTap), .none)
+        XCTAssertEqual(machine.state, .toggled)
+        XCTAssertEqual(machine.handle(.cancelled, mode: .holdOrTap), .none)
+        XCTAssertEqual(machine.state, .toggled)
+
+        XCTAssertEqual(machine.handle(.keyDown(at: 1), mode: .holdOrTap), .confirm)
+        XCTAssertEqual(machine.handle(.cancelled, mode: .holdOrTap), .none)
+        XCTAssertEqual(machine.state, .finishing)
+    }
 }
