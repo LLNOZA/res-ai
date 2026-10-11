@@ -19,7 +19,8 @@ RewritePromptBuilder creates a compact prompt
 including optional local writing profile and output language
         |
 RewriteService routes:
-- Cloud Run proxy when configured (Claude API by default, Vertex AI Gemini with AI_PROVIDER=vertex)
+- Claude API directly when the user's Claude API key is set (claude-haiku-5-5)
+- Cloud Run proxy when configured and no key is set (migration-period compatibility)
 - direct Vertex AI Gemini for development
 - local preview rewriter when auth is missing
         |
@@ -36,7 +37,7 @@ The app never presses Send. It only replaces the draft text.
 
 If replacement cannot be verified after the app attempts to insert text, ResponseAi leaves the generated reply on the clipboard and reports a manual-paste fallback instead of claiming success.
 
-`Run Readiness Check` verifies Accessibility, Input Monitoring, Screen Recording, Cloud Run proxy health, profile state, and the active hotkeys from the menu bar or Settings window.
+`Run Readiness Check` verifies Accessibility, Input Monitoring, Screen Recording, the active AI route, the Claude API key (`GET /v1/models`, no tokens used), Cloud Run proxy health, profile state, and the active hotkeys from the menu bar or Settings window. While a Claude API key is set, a failing proxy health check is reported but not treated as fatal.
 
 Accessibility and Input Monitoring request APIs are invoked only from an explicit permission action in the menu or Settings. Launch, feature attempts, lifecycle recovery, and the permission monitor only preflight the current TCC state; they never trigger another system permission prompt.
 
@@ -99,15 +100,15 @@ After replacement, the app tries to read both the original target element and th
 
 Typeless-style dictation into the focused field. On macOS 26+, Apple SpeechAnalyzer transcribes on-device. On macOS 14/15, `SFSpeechRecognizer` is the fallback (on-device when the locale supports it). AI only cleans the resulting text; it never receives audio, only text.
 
-Cleanup goes through the same Cloud Run proxy contract as rewriting (`ProxyDictationCleaner` → `CloudRunProxyClient`, `{systemInstruction, userPrompt}`; Claude `claude-haiku-5-5` by default). `DictationCleanupRouter` picks the route: proxy when configured; otherwise Gemini directly with the user's Gemini API key (`GeminiDictationCleaner`, model from Settings); with neither, the raw transcript stays as-is. Timeouts, failures, and rejected output (`DictationCleanupOutputValidator`) also leave the raw transcript in place.
+`DictationCleanupRouter` picks the route: the Claude API directly when the user's Claude API key is set (`ClaudeDictationCleaner` → `ClaudeAPIClient`); otherwise the Cloud Run proxy contract shared with rewriting (`ProxyDictationCleaner` → `CloudRunProxyClient`, `{systemInstruction, userPrompt}`), kept for the migration period; otherwise Gemini directly with the user's Gemini API key (`GeminiDictationCleaner`, using the previously saved model setting); with none of them, the raw transcript stays as-is. Timeouts, failures, and rejected output (`DictationCleanupOutputValidator`) also leave the raw transcript in place.
 
 ```text
 hotkey ──> SpeechAnalyzer (macOS 26+) or SFSpeechRecognizer (macOS 14/15)
            ja_JP default, volatile preview in the voice pill
       ──> UserDictionary.apply
       ──> TextReplacer.insertAtCaret            (raw text lands instantly)
-      ──> AI cleanup via Cloud Run proxy         (fillers / punctuation / homophones / dictionary)
-          (Gemini API key direct only when no proxy is configured)
+      ──> AI cleanup via Claude API (user's key)  (fillers / punctuation / homophones / dictionary)
+          (Cloud Run proxy when no key is set; Gemini API key direct only when neither is configured)
       ──> TextReplacer.replaceInsertedText       (swap only the inserted range, skip if field changed)
 ```
 
@@ -117,7 +118,7 @@ Default shortcut is `Command + Shift + Space`. Default mode is toggle: one press
 
 `FormReader` uses Accessibility to start from the focused element, find the owning app/window, traverse nearby AX nodes, collect text fields, text areas, and combo boxes, and pair them with likely labels from titles, placeholders, descriptions, and nearby static text.
 
-`FormFillPlanner` sends the scanned field snapshots plus the form-fill profile to the Cloud Run proxy and asks for JSON candidates only. The Mac app filters the response locally, removes low-confidence or duplicate suggestions, skips non-empty fields, and blocks password, payment, authentication, and consent-like labels. If the proxy is unavailable or the model returns nothing usable, `LocalFormFillPlanner` fills obvious fields such as name, company, email, phone, website, address, service, and free-text purpose from the local profile.
+`FormFillPlanner` sends the scanned field snapshots plus the form-fill profile to the Claude API directly when the user's Claude API key is set (otherwise to the Cloud Run proxy during the migration period) and asks for JSON candidates only. The Mac app filters the response locally, removes low-confidence or duplicate suggestions, skips non-empty fields, and blocks password, payment, authentication, and consent-like labels. If neither backend is available or the model returns nothing usable, `LocalFormFillPlanner` fills obvious fields such as name, company, email, phone, website, address, service, and free-text purpose from the local profile.
 
 Application still goes through `TextReplacer`, one field at a time, after the second shortcut press. Failed or unverified fields are reported in the HUD instead of being silently treated as complete.
 
@@ -135,7 +136,7 @@ public protocol TextRewriting {
 }
 ```
 
-The default router prefers the Cloud Run proxy when configured. In proxy mode, the Mac app sends only the prompt payload; project, location, and model are intentionally not sent by the client. If no proxy is configured, the older direct-Vertex development path can still use local config and a bearer token. If neither path is available, local preview mode is used.
+The default router prefers the Claude API directly (`ClaudeAPIClient`) when the user's Claude API key is set. Otherwise it uses the Cloud Run proxy when configured; the proxy is kept only for the migration period and will be removed later. In proxy mode, the Mac app sends only the prompt payload; project, location, and model are intentionally not sent by the client. If no proxy is configured, the older direct-Vertex development path can still use local config and a bearer token. If neither path is available, local preview mode is used.
 
 Builds must not bundle a Cloud Run proxy endpoint or shared key. Configure `RESAI_VERTEX_PROXY_URL` and `RESAI_PROXY_SHARED_SECRET` through a local environment or secret manager before using proxy mode. Direct-Vertex development can opt out with `RESAI_DISABLE_BUNDLED_PROXY=1`.
 
@@ -171,7 +172,17 @@ Rewrite, Restore, and Form Fill each use a global Command + Shift shortcut. User
 
 ### AI backend
 
-For production-style use, the AI backend and model are configured centrally through Cloud Run environment variables. The Mac app UI does not expose provider, project, location, or model selection to users.
+For internal use, each user enters their own Claude API key in `設定 > AI接続`. The key is stored only in the Keychain (account `anthropic.apiKey`); it is never written to UserDefaults, logs, or crash reports and is never embedded in the build. The settings screen shows the active route (Claude API direct / proxy / preview) and offers a connection test via `GET https://api.anthropic.com/v1/models`, which consumes no tokens.
+
+Route priority is shared by reply rewrite, form fill, and dictation cleanup (`AIBackendRoute`):
+
+1. Claude API key set → `ClaudeAPIClient` calls `POST https://api.anthropic.com/v1/messages` directly.
+2. No key, proxy configured → the Cloud Run proxy (migration-period compatibility).
+3. Neither → local preview (dictation keeps the raw transcript, or uses a Gemini API key if one is set).
+
+`ClaudeAPIClient` sends `x-api-key`, `anthropic-version: 2023-06-01`, the fixed model `claude-haiku-5-5`, `max_tokens` (4096 for rewrite and form fill; the existing length-based budget for dictation cleanup), `system`, and a single user message. It never sends `temperature`, `top_p`, or `top_k` because the model rejects them with HTTP 400. Responses whose `stop_reason` is not `end_turn` / `stop_sequence`, or whose text blocks are empty, are failures; `thinking` and other non-text blocks are discarded. Errors carry only the HTTP status and a coarse classification, never the response body, key, or prompt.
+
+The Cloud Run proxy configuration below applies only while the proxy is still in use. The Mac app UI does not expose provider, project, location, or model selection to users.
 
 - `AI_PROVIDER=anthropic` (default): the proxy calls the Claude API (`POST https://api.anthropic.com/v1/messages`) with `ANTHROPIC_MODEL`, default `claude-haiku-5-5`, for lower cost. `ANTHROPIC_API_KEY` is injected from Secret Manager.
 - `AI_PROVIDER=vertex`: rollback path to Vertex AI Gemini with `VERTEX_MODEL`, default `gemini-3.5-flash`.

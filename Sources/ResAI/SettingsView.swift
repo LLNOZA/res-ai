@@ -21,6 +21,10 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
+                    aiConnectionSection
+
+                    Divider()
+
                     voiceSection
 
                     Divider()
@@ -172,12 +176,6 @@ struct SettingsView: View {
                     }
                 }
                 GridRow {
-                    Text("Gemini モデル")
-                        .foregroundStyle(.secondary)
-                    TextField("gemini-3.8-flash", text: $voiceInput.settings.geminiModel)
-                        .textFieldStyle(.roundedBorder)
-                }
-                GridRow {
                     Text("言語")
                         .foregroundStyle(.secondary)
                     Picker("言語", selection: $voiceInput.settings.localeIdentifier) {
@@ -224,10 +222,76 @@ struct SettingsView: View {
     }
 
     private var cleanupRouteNote: String {
-        if controller.config.proxyURL != nil {
-            return "整えは AIプロキシ経由で行います。Gemini APIキーとモデルはプロキシ未設定時のみ使用します。"
+        if controller.hasClaudeAPIKey {
+            return "整えは Claude API で直接行います。Gemini APIキーは Claude APIキーとAIプロキシがどちらも未設定のときだけ使用します。"
         }
-        return "AIプロキシが未設定のため、整えは Gemini APIキーで直接行います（キーが空なら整えずに生テキストのまま）。"
+        if controller.config.proxyURL != nil {
+            return "整えは AIプロキシ経由で行います。Gemini APIキーはプロキシ未設定時のみ使用します。"
+        }
+        return "Claude APIキーとAIプロキシが未設定のため、整えは Gemini APIキーで直接行います（キーが空なら整えずに生テキストのまま）。"
+    }
+
+    private var aiConnectionSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("AI接続")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            Text("返信生成・フォーム入力・音声入力の整えは、ここで設定した自分の Claude APIキーで直接 Claude API を呼びます。キーはキーチェーンにだけ保存します。")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 9) {
+                GridRow {
+                    Text("Claude APIキー")
+                        .foregroundStyle(.secondary)
+                    SecureField(
+                        controller.hasClaudeAPIKey ? "設定済み（変更する場合のみ入力）" : "sk-ant-...",
+                        text: $controller.claudeAPIKeyInput
+                    )
+                    .textFieldStyle(.roundedBorder)
+                }
+                GridRow {
+                    Text("現在の経路")
+                        .foregroundStyle(.secondary)
+                    Text(controller.activeAIRoute.displayName)
+                        .font(.system(size: 12, weight: .medium))
+                }
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    controller.saveClaudeAPIKey()
+                } label: {
+                    Label("キーを保存", systemImage: "key")
+                }
+                .disabled(controller.claudeAPIKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button(role: .destructive) {
+                    controller.deleteClaudeAPIKey()
+                } label: {
+                    Label("削除", systemImage: "trash")
+                }
+                .disabled(!controller.hasClaudeAPIKey)
+                Button {
+                    controller.testClaudeConnection()
+                } label: {
+                    Label("接続テスト", systemImage: "antenna.radiowaves.left.and.right")
+                }
+                if let result = controller.claudeConnectionTestResult {
+                    Text(result)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+            .buttonStyle(.bordered)
+
+            Text("Claude APIキーが未設定の場合は、詳細接続設定のAIプロキシ（移行期間の互換用）を使います。どちらも無い場合はプレビュー動作です。")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     private var voiceHelpText: String {

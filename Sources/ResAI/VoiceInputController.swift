@@ -3,8 +3,8 @@ import Foundation
 import ResAICore
 
 /// Hold-to-talk voice input with tap-to-toggle fallback: on-device transcription is inserted at
-/// the caret, then an optional AI cleanup pass (Cloud Run proxy, or Gemini directly when no
-/// proxy is configured) swaps only the inserted text afterwards.
+/// the caret, then an optional AI cleanup pass (Claude API directly with the user's key, else
+/// the Cloud Run proxy, else Gemini directly) swaps only the inserted text afterwards.
 @MainActor
 final class VoiceInputController: ObservableObject {
     @Published var settings: VoiceInputSettings
@@ -35,6 +35,7 @@ final class VoiceInputController: ObservableObject {
     private let replacer: TextReplacer
     private let permissionManager: AccessibilityPermissionManager
     private let proxyConfigProvider: () -> VertexAIConfig
+    private let claudeAPIKeyProvider: () -> String?
     private var phase: Phase = .idle
     private var sessionLifecycle = VoiceSessionLifecycle()
     private var activeSessionID: VoiceSessionID?
@@ -73,12 +74,14 @@ final class VoiceInputController: ObservableObject {
         permissionManager: AccessibilityPermissionManager,
         voicePill: VoicePillController = VoicePillController(),
         engine: (any SpeechDictating)? = nil,
-        proxyConfigProvider: @escaping () -> VertexAIConfig = { VertexAIConfig.load() }
+        proxyConfigProvider: @escaping () -> VertexAIConfig = { VertexAIConfig.load() },
+        claudeAPIKeyProvider: @escaping () -> String? = { ClaudeAPIKeyStore.load() }
     ) {
         self.reader = reader
         self.replacer = replacer
         self.permissionManager = permissionManager
         self.proxyConfigProvider = proxyConfigProvider
+        self.claudeAPIKeyProvider = claudeAPIKeyProvider
         self.voicePill = voicePill
         self.engine = engine ?? SpeechDictationEngineFactory.make()
         self.settings = VoiceInputSettings.load()
@@ -94,8 +97,12 @@ final class VoiceInputController: ObservableObject {
         !geminiAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    var hasClaudeKey: Bool {
+        !(claudeAPIKeyProvider()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
+    }
+
     var cleanupRoute: DictationCleanupRoute {
-        .select(config: proxyConfigProvider(), hasGeminiKey: hasGeminiKey)
+        .select(config: proxyConfigProvider(), hasClaudeKey: hasClaudeKey, hasGeminiKey: hasGeminiKey)
     }
 
     /// Downloads/reserves the on-device model ahead of the first press so start is near-instant.
@@ -720,9 +727,18 @@ final class VoiceInputController: ObservableObject {
         let config = proxyConfigProvider()
         return DictationCleanupRouter(
             config: config,
+            claudeCleaner: makeClaudeCleaner(),
             proxyCleaner: ProxyDictationCleaner(client: CloudRunProxyClient(configProvider: { config })),
             geminiCleaner: makeGeminiCleaner()
         )
+    }
+
+    private func makeClaudeCleaner() -> (any DictationCleaning)? {
+        guard hasClaudeKey else {
+            return nil
+        }
+        let claudeAPIKeyProvider = claudeAPIKeyProvider
+        return ClaudeDictationCleaner(client: ClaudeAPIClient(apiKeyProvider: claudeAPIKeyProvider))
     }
 
     private func makeGeminiCleaner() -> (any DictationCleaning)? {
@@ -766,7 +782,9 @@ final class VoiceInputController: ObservableObject {
 
     func testCleanupConnection() {
         let config = proxyConfigProvider()
-        switch DictationCleanupRoute.select(config: config, hasGeminiKey: hasGeminiKey) {
+        switch DictationCleanupRoute.select(config: config, hasClaudeKey: hasClaudeKey, hasGeminiKey: hasGeminiKey) {
+        case .claude:
+            testClaudeConnection()
         case .proxy:
             testProxyCleanupConnection(config: config)
         case .gemini, .none:
@@ -790,6 +808,21 @@ final class VoiceInputController: ObservableObject {
             } catch {
                 self?.lastConnectionTestResult = "接続NG（AIプロキシ）: \(error.localizedDescription)"
                 AppLog.write("cleanup proxy connection test failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func testClaudeConnection() {
+        lastConnectionTestResult = "確認中..."
+        let client = ClaudeAPIClient(apiKeyProvider: claudeAPIKeyProvider)
+        Task { @MainActor [weak self] in
+            do {
+                try await client.verifyAPIKey()
+                self?.lastConnectionTestResult = "接続OK（Claude API 直接）"
+                AppLog.write("cleanup claude connection test ok")
+            } catch {
+                self?.lastConnectionTestResult = "接続NG（Claude API）: \(error.localizedDescription)"
+                AppLog.write("cleanup claude connection test failed: \(error.localizedDescription)")
             }
         }
     }
@@ -844,6 +877,8 @@ final class VoiceInputController: ObservableObject {
 
     private var cleanupReadinessLine: String {
         switch cleanupRoute {
+        case .claude:
+            "OK AI整え（Claude API 直接）"
         case .proxy:
             "OK AI整え（AIプロキシ経由）"
         case .gemini:
