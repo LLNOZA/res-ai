@@ -126,6 +126,7 @@ test("anthropic is the default provider and sends a Messages API request", async
   assert.equal(upstream.system, "test instruction");
   assert.deepEqual(upstream.messages, [{ role: "user", content: "test prompt" }]);
   assert.equal(upstream.max_tokens, 4096);
+  assert.equal("temperature" in upstream, false);
 });
 
 test("anthropic model is configured centrally", async t => {

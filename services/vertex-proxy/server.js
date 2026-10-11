@@ -295,7 +295,7 @@ async function callAnthropic({
       body: JSON.stringify({
         model,
         max_tokens: 4096,
-        temperature: 0.25,
+        // claude-haiku-5-5 rejects sampling parameters such as temperature (HTTP 400).
         system: systemInstruction,
         messages: [
           { role: "user", content: userPrompt }
