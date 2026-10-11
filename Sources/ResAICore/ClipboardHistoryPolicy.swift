@@ -3,6 +3,9 @@ import Foundation
 public enum ClipboardHistoryPolicy {
     public static let maxCharacters = 20_000
     public static let retention: TimeInterval = 7 * 24 * 60 * 60
+    /// A clock set back (NTP after wake, manual change) makes recent items look like
+    /// they were copied in the future. Keep them instead of silently dropping history.
+    public static let futureTolerance: TimeInterval = 24 * 60 * 60
 
     public static func shouldStore(text: String, typeNames: [String]) -> Bool {
         let excluded = ["org.nspasteboard.concealedtype", "org.nspasteboard.transienttype",
@@ -15,6 +18,7 @@ public enum ClipboardHistoryPolicy {
     }
 
     public static func isRetained(copiedAt: Date, now: Date = Date()) -> Bool {
-        now.timeIntervalSince(copiedAt) >= 0 && now.timeIntervalSince(copiedAt) <= retention
+        let age = now.timeIntervalSince(copiedAt)
+        return age >= -futureTolerance && age <= retention
     }
 }

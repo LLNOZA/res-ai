@@ -74,13 +74,25 @@ final class AppControllerPermissionPromptTests: XCTestCase {
         XCTAssertEqual(probe.openedSettingsURLs.count, 2)
     }
 
+    private var environments: [AppEnvironment] = []
+
+    override func tearDown() async throws {
+        for environment in environments {
+            environment.discard()
+        }
+        environments.removeAll()
+        try await super.tearDown()
+    }
+
     private func makeController(probe: PermissionProbe) -> AppController {
-        AppController(
+        let environment = AppEnvironment.isolated(openURL: { url in
+            probe.openedSettingsURLs.append(url)
+            return true
+        })
+        environments.append(environment)
+        return AppController(
             permissionManager: probe.makeManager(),
-            systemSettingsURLOpener: { url in
-                probe.openedSettingsURLs.append(url)
-                return true
-            }
+            environment: environment
         )
     }
 }

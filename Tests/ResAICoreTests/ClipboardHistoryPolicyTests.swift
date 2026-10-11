@@ -19,6 +19,9 @@ final class ClipboardHistoryPolicyTests: XCTestCase {
         XCTAssertTrue(ClipboardHistoryPolicy.isRetained(copiedAt: now, now: now))
         XCTAssertTrue(ClipboardHistoryPolicy.isRetained(copiedAt: now.addingTimeInterval(-604800), now: now))
         XCTAssertFalse(ClipboardHistoryPolicy.isRetained(copiedAt: now.addingTimeInterval(-604801), now: now))
-        XCTAssertFalse(ClipboardHistoryPolicy.isRetained(copiedAt: now.addingTimeInterval(1), now: now))
+        // A clock set back by NTP or by hand must not drop items copied moments ago.
+        XCTAssertTrue(ClipboardHistoryPolicy.isRetained(copiedAt: now.addingTimeInterval(1), now: now))
+        XCTAssertTrue(ClipboardHistoryPolicy.isRetained(copiedAt: now.addingTimeInterval(86_400), now: now))
+        XCTAssertFalse(ClipboardHistoryPolicy.isRetained(copiedAt: now.addingTimeInterval(86_401), now: now))
     }
 }

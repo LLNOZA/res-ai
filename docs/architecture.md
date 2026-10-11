@@ -112,6 +112,8 @@ hotkey ──> SpeechAnalyzer (macOS 26+) or SFSpeechRecognizer (macOS 14/15)
       ──> TextReplacer.replaceInsertedText       (swap only the inserted range, skip if field changed)
 ```
 
+On macOS 14/15 the `SFSpeechRecognizer` engine checks authorization before asking (denied/restricted fail with guidance instead of a silent prompt), reports an unavailable recognizer (Dictation off, no network for server-only locales) as an error, and stops after three consecutive recognition errors instead of restarting forever. Its system services (authorization, microphone, recognizer, capture) are injected, so the legacy path is unit-tested on any OS; `RESAI_FORCE_LEGACY_SPEECH=1` selects it at runtime on macOS 26. `MicrophoneCapture` validates the input node's hardware and tap formats before `installTap` (0 Hz, 0 channels, or a stale sample rate would raise an uncatchable exception), refuses a second tap, and on `AVAudioEngineConfigurationChange` resumes on a fresh `AVAudioEngine` or ends the session with an error.
+
 Default shortcut is `Command + Shift + Space` (changeable in Settings, including modifier-only chords such as `fn + Command`). Default mode is toggle: one press starts listening, the next press confirms. An optional hold mode (≥ 250 ms hold listens while held and confirms on release; a quicker tap falls back to toggle) can be selected in Settings. Escape cancels while listening. After cleanup, Restore (`Command + Shift + U`) reverts to the raw transcript for 60 seconds before falling through to rewrite-draft restore.
 
 ### FormReader and FormFillPlanner
@@ -121,6 +123,16 @@ Default shortcut is `Command + Shift + Space` (changeable in Settings, including
 `FormFillPlanner` sends the scanned field snapshots plus the form-fill profile to the Claude API directly when the user's Claude API key is set (otherwise to the Cloud Run proxy during the migration period) and asks for JSON candidates only. The Mac app filters the response locally, removes low-confidence or duplicate suggestions, skips non-empty fields, and blocks password, payment, authentication, and consent-like labels. If neither backend is available or the model returns nothing usable, `LocalFormFillPlanner` fills obvious fields such as name, company, email, phone, website, address, service, and free-text purpose from the local profile.
 
 Application still goes through `TextReplacer`, one field at a time, after the second shortcut press. Failed or unverified fields are reported in the HUD instead of being silently treated as complete.
+
+### Clipboard history
+
+`ClipboardHistoryStore` polls the pasteboard's `changeCount` every 0.8 s on the main run loop (common modes, so menus do not pause it) and once more on system wake. `startMonitoring` is idempotent and `stopMonitoring` only saves. Items are removed in bulk only by "履歴を消去" or by turning history off; both log `clipboard history cleared reason=...`. A clock set back by up to a day does not drop recent items, and an unreadable saved list is kept aside under `clipboardHistory.items.v1.unreadable` instead of being overwritten. A failed quick-menu paste logs its reason (`no-focused-input`, `target-app-gone`, `focus-unreadable`, `focus-moved`, `cancelled`) without the text.
+
+### Environment and diagnostics
+
+`AppEnvironment` bundles UserDefaults, the secret store, the pasteboard, and the System Settings opener. The app uses `.live`; inside an XCTest process the default is an isolated environment and `AppLog` writes to a temporary directory, so `swift test` never changes the user's settings, Keychain, clipboard, or log.
+
+At launch `SessionExitTracker` logs whether the previous run reached `applicationWillTerminate`, and `MetricKitDiagnosticsRecorder` saves MetricKit crash and hang payloads (sanitized by `DiagnosticPayloadSanitizer`) under `~/Library/Logs/ResponseAi/diagnostics/`. `DiagnosticsExporter` zips the log, those JSON files, and a system summary to the Desktop from Settings.
 
 ### HUDController
 

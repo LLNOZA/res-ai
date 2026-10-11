@@ -413,6 +413,20 @@ struct SettingsView: View {
 
             Toggle("デバッグ用にテキストプレビューをログ保存", isOn: $controller.diagnosticTextPreviewLoggingEnabled)
                 .help("通常はオフです。オンにすると、短い下書き/文脈プレビューをローカル診断ログに保存します。")
+
+            HStack(spacing: 10) {
+                Button {
+                    controller.exportDiagnostics()
+                } label: {
+                    Label("診断情報を書き出す", systemImage: "square.and.arrow.up")
+                }
+                Spacer()
+            }
+
+            Text("ログ・クラッシュ診断・OS とアプリのバージョンを zip にしてデスクトップに保存します。入力・コピーした文章は含みません（上のテキストプレビュー保存がオンの場合を除く）。")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 

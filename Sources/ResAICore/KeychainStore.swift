@@ -93,3 +93,22 @@ public struct KeychainStore: Sendable, SecretStringStoring {
         throw KeychainStoreError.unexpectedStatus(status)
     }
 }
+
+/// Keeps secrets in memory only. Tests use it so a test run never reads or writes the
+/// user's Keychain. Like `KeychainStore`, an empty value deletes the entry.
+public final class InMemorySecretStore: SecretStringStoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String: String] = [:]
+
+    public init(_ values: [String: String] = [:]) {
+        self.values = values
+    }
+
+    public func string(for account: String) throws -> String? {
+        lock.withLock { values[account] }
+    }
+
+    public func setString(_ value: String, for account: String) throws {
+        lock.withLock { values[account] = value.isEmpty ? nil : value }
+    }
+}

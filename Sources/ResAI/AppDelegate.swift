@@ -46,6 +46,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var appliedMenuBarIconEnabled: Bool?
     private var didWarnMenuBarIconHidden = false
     private var showingFloatingButtonForNotch = false
+    private var diagnosticsRecorder: MetricKitDiagnosticsRecorder?
 
     private var currentHotKeyManagers: [(String, GlobalHotKeyManager?)] {
         [
@@ -95,7 +96,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        AppLog.write("app launched")
+        AppLog.write("app launched version=\(AppVersionInfo.version) build=\(AppVersionInfo.build) os=\(AppVersionInfo.operatingSystem) model=\(AppVersionInfo.hardwareModel) speech=\(SpeechDictationEngineFactory.engineName)")
+        startCrashDiagnostics()
         configureControllerCallbacks()
         if controller.hotKeyPermissionsAreGranted {
             configureHotKey()
@@ -116,6 +118,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startKeyLivenessMonitor()
         startHotKeyWatchdog()
         secureInputWasActive = GlobalHotKeyManager.isSecureInputActive
+    }
+
+    /// Logs how the previous run ended and starts saving MetricKit crash/hang reports.
+    private func startCrashDiagnostics() {
+        let previous = SessionExitTracker(defaults: controller.environment.defaults)
+            .beginSession(version: "\(AppVersionInfo.version) (\(AppVersionInfo.build))")
+        AppLog.write(SessionExitTracker.logLine(for: previous))
+        let recorder = MetricKitDiagnosticsRecorder(
+            directory: AppLog.logDirectory.appendingPathComponent("diagnostics")
+        )
+        recorder.start()
+        diagnosticsRecorder = recorder
     }
 
     /// Global shortcuts can die silently in two ways: macOS switches an event tap off
@@ -350,6 +364,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             manager?.unregister()
         }
         controller.shutDown()
+        diagnosticsRecorder?.stop()
+        SessionExitTracker(defaults: controller.environment.defaults).endSession()
+        AppLog.write("app terminating normally")
         AppLog.flushSync()
     }
 
@@ -949,7 +966,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func clearClipboardHistory() {
-        AppLog.write("clipboard history cleared")
+        AppLog.write("clipboard history clear selected from quick menu")
         controller.clearClipboardHistory()
     }
 
