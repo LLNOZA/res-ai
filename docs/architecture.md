@@ -112,7 +112,7 @@ hotkey ──> SpeechAnalyzer (macOS 26+) or SFSpeechRecognizer (macOS 14/15)
       ──> TextReplacer.replaceInsertedText       (swap only the inserted range, skip if field changed)
 ```
 
-Default shortcut is `Command + Shift + Space`. Default mode is toggle: one press starts listening, the next press confirms. An optional hold mode (≥ 250 ms hold listens while held and confirms on release; a quicker tap falls back to toggle) can be selected in Settings. Escape cancels while listening. After cleanup, Restore (`Command + Shift + U`) reverts to the raw transcript for 60 seconds before falling through to rewrite-draft restore.
+Default shortcut is `Command + Shift + Space` (changeable in Settings, including modifier-only chords such as `fn + Command`). Default mode is toggle: one press starts listening, the next press confirms. An optional hold mode (≥ 250 ms hold listens while held and confirms on release; a quicker tap falls back to toggle) can be selected in Settings. Escape cancels while listening. After cleanup, Restore (`Command + Shift + U`) reverts to the raw transcript for 60 seconds before falling through to rewrite-draft restore.
 
 ### FormReader and FormFillPlanner
 
@@ -168,7 +168,11 @@ The user can enable or disable profile use per rewrite session from Settings. Th
 
 ### Shortcuts
 
-Rewrite, Restore, and Form Fill each use a global Command + Shift shortcut. Users can change the letter key in Settings. Shortcut settings are stored locally, sanitized to avoid duplicates, used by the menu key equivalents, and re-registered immediately when changed.
+Voice, Rewrite, Restore, Form Fill, and Quick Menu each use a global shortcut recorded in Settings (click the field, press the combination). A shortcut is a virtual key code plus any of Command / Option / Control / Shift (`HotKeyShortcut`); its label comes from the current keyboard layout via `UCKeyTranslate`, so JIS keyboards show the printed key. Voice may instead use a modifier-only chord of two or more modifiers including fn (`ShortcutTrigger.modifierChord`), detected by `ModifierChordDetector` from `flagsChanged` without swallowing events.
+
+`AppShortcuts.validationError` refuses keys without a modifier (except F1–F12), Shift plus a character, duplicates between actions, modifier-only chords for actions other than Voice, and the `ReservedShortcut.all` list of macOS / common app shortcuts. While a field records, the event taps stay installed but pass every key through (`GlobalHotKeyManager.isSuspended`), so an already registered combination can be recorded again. If registration fails, the previous shortcuts are restored and the reason is shown under the row.
+
+Settings are stored in `shortcuts.v2` (`{"version":2,"rewrite":{"keyCode":38,"modifiers":["command","shift"]},…,"voice":{"type":"key"|"modifiers",…}}`). When `shortcuts.v2` has never been written, the 0.4.0 payload in `shortcuts.v1` (Command + Shift + letter, fn + Command, Command + Space) is converted to the same shortcuts; `shortcuts.v1` is left untouched. Unreadable data falls back to the defaults. Loaded settings are sanitized only for shape and duplicates, so a migrated reserved combination such as Command + Space keeps working.
 
 ### AI backend
 

@@ -48,6 +48,7 @@ public final class GlobalHotKeyManager: @unchecked Sendable {
     /// separate from `onTapReenabled` for source compatibility with existing users.
     public var onTapDisabled: (@Sendable (HotKeyTapDisableReason) -> Void)?
     private var isPressed = false
+    private var _isSuspended = false
     private var isModifierChordMode = false
     /// Only touched from the event-tap callback thread. See type comment above.
     private var chordDetector = ModifierChordDetector(requiredFlags: [.maskSecondaryFn, .maskCommand])
@@ -77,7 +78,16 @@ public final class GlobalHotKeyManager: @unchecked Sendable {
     }
 
     public func register(_ shortcut: HotKeyShortcut, id: UInt32 = 1) throws {
-        try register(keyCode: shortcut.keyCode, modifiers: shortcut.modifiers, id: id)
+        try register(keyCode: shortcut.keyCode, modifiers: shortcut.carbonModifiers, id: id)
+    }
+
+    public func register(_ trigger: ShortcutTrigger, id: UInt32 = 1) throws {
+        switch trigger {
+        case .key(let shortcut):
+            try register(shortcut, id: id)
+        case .modifierChord(let modifiers):
+            try register(modifierChord: modifiers.eventFlags, id: id)
+        }
     }
 
     public func register(keyCode: UInt32, modifiers: UInt32, id: UInt32 = 1) throws {
@@ -96,7 +106,7 @@ public final class GlobalHotKeyManager: @unchecked Sendable {
         storedRegistration = .key(code: keyCode, modifiers: modifiers)
     }
 
-    /// Modifier-only chord (voice trigger `fn + ⌘`). `flagsChanged` is never swallowed.
+    /// Modifier-only chord (voice trigger such as `fn + ⌘`). `flagsChanged` is never swallowed.
     public func register(modifierChord flags: CGEventFlags, id _: UInt32 = 1) throws {
         unregister()
 
@@ -154,6 +164,20 @@ public final class GlobalHotKeyManager: @unchecked Sendable {
                 }
 
                 manager.noteTapEvent()
+
+                if manager.isSuspended {
+                    // The settings window is recording a new shortcut: let every key
+                    // through, and forget a half-pressed chord so resuming starts clean.
+                    if manager.isModifierChordMode {
+                        if manager.chordDetector.reset() {
+                            manager.setPressedFromTapThread(false)
+                            manager.emitReleased()
+                        }
+                    } else if type == .keyUp, manager.matchesKeyCode(event), manager.takePressed() {
+                        manager.emitReleased()
+                    }
+                    return Unmanaged.passUnretained(event)
+                }
 
                 if manager.isModifierChordMode {
                     return manager.handleModifierChord(type: type, event: event)
@@ -356,6 +380,21 @@ public final class GlobalHotKeyManager: @unchecked Sendable {
     }
 
 
+    /// While true the tap stays installed (so health checks and recovery are
+    /// unaffected) but passes every event through without firing.
+    public var isSuspended: Bool {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _isSuspended
+        }
+        set {
+            lock.lock()
+            _isSuspended = newValue
+            lock.unlock()
+        }
+    }
+
     /// Whether a tap is installed and currently enabled.
     public var isTapEnabled: Bool {
         lock.lock()
@@ -475,7 +514,11 @@ public final class GlobalHotKeyManager: @unchecked Sendable {
 
         // Match the complete modifier chord. In particular, ⌘⇧⌥J must not steal
         // the ⌘⇧J shortcut, and Caps Lock / fn must not be silently ignored.
-        return HotKeyModifierMatcher.matches(eventFlags: event.flags, requiredFlags: requiredFlags)
+        return HotKeyModifierMatcher.matches(
+            eventFlags: event.flags,
+            requiredFlags: requiredFlags,
+            keyCode: UInt32(keyCode)
+        )
     }
 
     private func emitTapDisabled(_ reason: HotKeyTapDisableReason) {

@@ -14,7 +14,13 @@ final class AppController: ObservableObject {
     @Published var diagnosticTextPreviewLoggingEnabled: Bool
     @Published var userProfile: UserProfile
     @Published var userProfileEnabled: Bool
-    @Published var shortcuts: AppShortcuts
+    @Published private(set) var shortcuts: AppShortcuts
+    /// The settings row currently waiting for a key combination.
+    @Published private(set) var recordingShortcutAction: ShortcutAction?
+    /// Why the last recording for a row was refused, shown under that row.
+    @Published private(set) var shortcutErrors: [ShortcutAction: String] = [:]
+    /// Failure of "すべて標準に戻す", shown under the whole section.
+    @Published private(set) var shortcutResetError: String?
     /// Input buffer for the settings SecureField only. The saved key lives in the Keychain.
     @Published var claudeAPIKeyInput = ""
     @Published private(set) var hasClaudeAPIKey: Bool
@@ -26,7 +32,10 @@ final class AppController: ObservableObject {
     var onStatusChange: ((String) -> Void)?
     var onHUDMessage: ((HUDMessage) -> Void)?
     var onModeChange: ((RewriteMode) -> Void)?
-    var onShortcutsChange: ((AppShortcuts) -> Void)?
+    /// Re-registers the global shortcuts. Returns the registration error, if any.
+    var onShortcutsChange: ((AppShortcuts) -> String?)?
+    /// Pauses (true) or resumes (false) global shortcuts while a key is being recorded.
+    var onShortcutRecordingChange: ((Bool) -> Void)?
     var onHideHUD: (() -> Void)?
     var onHotKeyPermissionsGranted: (() -> Bool)?
     var shortcutDiagnosticsProvider: (() -> [String])?
@@ -447,24 +456,113 @@ final class AppController: ObservableObject {
         }
     }
 
-    func saveShortcuts(showHUD: Bool = true) {
+    /// Saves and re-registers the current shortcuts. Returns the registration error, if any.
+    @discardableResult
+    func saveShortcuts(showHUD: Bool = true) -> String? {
         let sanitized = shortcuts.sanitized()
         if sanitized != shortcuts {
             shortcuts = sanitized
         }
         sanitized.save()
-        onShortcutsChange?(sanitized)
+        let failure = onShortcutsChange?(sanitized)
         AppLog.write("shortcuts saved rewrite=\(sanitized.rewrite.displayName) restore=\(sanitized.restore.displayName) form=\(sanitized.formFill.displayName) menu=\(sanitized.quickMenu.displayName) voice=\(sanitized.voiceTrigger.displayName)")
-        if showHUD {
+        if showHUD, failure == nil {
             setStatus("Shortcuts")
             self.showHUD(HUDMessage(
                 title: "ショートカットを保存しました",
-                detail: "⌘ + ⇧ は固定",
+                detail: "設定 > ショートカットで変更できます",
                 preview: shortcutSummary(for: sanitized),
                 tone: .success,
                 duration: 2.6
             ))
         }
+        return failure
+    }
+
+    func beginRecordingShortcut(_ action: ShortcutAction) {
+        if recordingShortcutAction == nil {
+            onShortcutRecordingChange?(true)
+        }
+        recordingShortcutAction = action
+        shortcutErrors[action] = nil
+        shortcutResetError = nil
+    }
+
+    /// With an `action`, cancels only that row's recording, so a field torn down
+    /// after the user clicked another row does not cancel the new one.
+    func cancelRecordingShortcut(_ action: ShortcutAction? = nil) {
+        guard let recording = recordingShortcutAction, action == nil || action == recording else { return }
+        recordingShortcutAction = nil
+        onShortcutRecordingChange?(false)
+    }
+
+    func finishRecordingShortcut(_ trigger: ShortcutTrigger, for action: ShortcutAction) {
+        guard recordingShortcutAction == action else { return }
+        recordingShortcutAction = nil
+        onShortcutRecordingChange?(false)
+        applyShortcut(trigger, for: action)
+    }
+
+    func resetShortcut(_ action: ShortcutAction) {
+        cancelRecordingShortcut()
+        applyShortcut(AppShortcuts.defaults.trigger(for: action), for: action)
+    }
+
+    func resetAllShortcuts() {
+        cancelRecordingShortcut()
+        let previous = shortcuts
+        shortcuts = .defaults
+        shortcutErrors = [:]
+        shortcutResetError = nil
+        if let failure = saveShortcuts(showHUD: false) {
+            shortcutResetError = revertShortcuts(to: previous, failure: failure)
+            return
+        }
+        showShortcutChangedHUD(title: "ショートカットを標準に戻しました")
+    }
+
+    /// Validates, saves, and registers one recorded shortcut. When the event tap
+    /// cannot be installed the previous shortcuts are restored and the reason shown.
+    private func applyShortcut(_ trigger: ShortcutTrigger, for action: ShortcutAction) {
+        guard shortcuts.trigger(for: action) != trigger else {
+            shortcutErrors[action] = nil
+            return
+        }
+        if let error = shortcuts.validationError(for: trigger, action: action) {
+            shortcutErrors[action] = error.errorDescription
+            AppLog.write("shortcut rejected action=\(action.rawValue) shortcut=\(trigger.displayName) reason=\(error)")
+            return
+        }
+        let previous = shortcuts
+        var updated = shortcuts
+        updated.set(trigger, for: action)
+        shortcuts = updated
+        shortcutErrors[action] = nil
+        shortcutResetError = nil
+        if let failure = saveShortcuts(showHUD: false) {
+            shortcutErrors[action] = revertShortcuts(to: previous, failure: failure)
+            return
+        }
+        showShortcutChangedHUD(title: "\(action.displayName): \(trigger.displayName)")
+    }
+
+    /// Returns the message to show where the change was requested.
+    private func revertShortcuts(to previous: AppShortcuts, failure: String) -> String {
+        AppLog.write("shortcut registration failed; reverted: \(failure)")
+        shortcuts = previous
+        saveShortcuts(showHUD: false)
+        return "登録できなかったため元に戻しました: \(failure)"
+    }
+
+    private func showShortcutChangedHUD(title: String) {
+        setStatus("Shortcuts")
+        showHUD(HUDMessage(
+            title: title,
+            detail: "ショートカットを変更しました",
+            preview: shortcutSummary(for: shortcuts),
+            tone: .success,
+            duration: 2.6
+        ))
     }
 
     func saveUserProfile() {

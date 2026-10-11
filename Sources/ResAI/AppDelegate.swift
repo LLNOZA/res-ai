@@ -27,6 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastHotKeyRecoveryDescription = "未実行"
     private var hotKeyRegistrationError: String?
     private var mayRetryMissingRegistration = true
+    private var hotKeysSuspendedForRecording = false
     private var voiceMenuItem: NSMenuItem?
     private var modeMenuItems: [NSMenuItem] = []
     private var floatingButtonMenuItem: NSMenuItem?
@@ -378,8 +379,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.updateModeMenuState()
         }
         controller.onShortcutsChange = { [weak self] _ in
-            self?.configureHotKey()
-            self?.updateShortcutMenuItems()
+            guard let self else { return nil }
+            let failure = self.configureHotKey(presentsAlert: false)
+            self.updateShortcutMenuItems()
+            return failure
+        }
+        controller.onShortcutRecordingChange = { [weak self] isRecording in
+            self?.setHotKeysSuspended(isRecording)
         }
     }
 
@@ -504,36 +510,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let rewriteItem = NSMenuItem(
             title: "返信を整える",
             action: #selector(rewriteFocusedDraft),
-            keyEquivalent: controller.shortcuts.rewrite.keyEquivalent
+            keyEquivalent: ""
         )
-        rewriteItem.keyEquivalentModifierMask = [.command, .shift]
+        applyMenuShortcut(controller.shortcuts.rewrite, to: rewriteItem)
         rewriteMenuItem = rewriteItem
         menu.addItem(rewriteItem)
 
         let restoreItem = NSMenuItem(
             title: "直前の下書きに戻す",
             action: #selector(restoreLastDraft),
-            keyEquivalent: controller.shortcuts.restore.keyEquivalent
+            keyEquivalent: ""
         )
-        restoreItem.keyEquivalentModifierMask = [.command, .shift]
+        applyMenuShortcut(controller.shortcuts.restore, to: restoreItem)
         restoreMenuItem = restoreItem
         menu.addItem(restoreItem)
 
         let formFillItem = NSMenuItem(
             title: "プロフィールでフォーム入力",
             action: #selector(fillFormFromProfile),
-            keyEquivalent: controller.shortcuts.formFill.keyEquivalent
+            keyEquivalent: ""
         )
-        formFillItem.keyEquivalentModifierMask = [.command, .shift]
+        applyMenuShortcut(controller.shortcuts.formFill, to: formFillItem)
         formFillMenuItem = formFillItem
         menu.addItem(formFillItem)
 
         let quickItem = NSMenuItem(
             title: "クイックメニュー",
             action: #selector(showQuickActionMenu),
-            keyEquivalent: controller.shortcuts.quickMenu.keyEquivalent
+            keyEquivalent: ""
         )
-        quickItem.keyEquivalentModifierMask = [.command, .shift]
+        applyMenuShortcut(controller.shortcuts.quickMenu, to: quickItem)
         quickMenuItem = quickItem
         menu.addItem(quickItem)
         menu.addItem(NSMenuItem.separator())
@@ -622,20 +628,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
-    private func configureHotKey(reason: String = "configuration") {
+    /// While the settings window records a shortcut, the taps stay installed but
+    /// let keys through, so the user can re-record a combination already in use.
+    private func setHotKeysSuspended(_ suspended: Bool) {
+        hotKeysSuspendedForRecording = suspended
+        for (_, manager) in currentHotKeyManagers {
+            manager?.isSuspended = suspended
+        }
+        AppLog.write("global hotkeys \(suspended ? "paused" : "resumed") for shortcut recording")
+    }
+
+    /// Returns the registration error. Deferred registration (no permission yet)
+    /// is not an error: the saved shortcuts are registered once permission arrives.
+    @discardableResult
+    private func configureHotKey(reason: String = "configuration", presentsAlert: Bool = true) -> String? {
         guard controller.hotKeyPermissionsAreGranted else {
             hotKeyRegistrationError = "アクセシビリティ／入力監視が未許可"
             lastHotKeyRecoveryDescription = "登録保留（権限待ち）"
             mayRetryMissingRegistration = false
             AppLog.write("global hotkey registration skipped reason=\(reason) keyboard-permissions")
-            return
+            return nil
         }
 
         let shortcuts = controller.shortcuts.sanitized()
         if reason == "configuration", configuredShortcuts == shortcuts,
            currentHotKeyManagers.allSatisfy({ $0.1?.isRegistered == true }) {
             evaluateHotKeyHealth(reason: "settings-unchanged")
-            return
+            return nil
         }
         let configuration = UUID()
         let rewriteManager = GlobalHotKeyManager { [weak self] in
@@ -688,6 +707,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ("menu", quickMenuManager), ("voice", voiceManager)
         ]
         for (name, manager) in candidates {
+            manager.isSuspended = hotKeysSuspendedForRecording
             manager.onTapDisabled = { [weak self] disableReason in
                 Task { @MainActor in
                     AppLog.write("event tap disabled slot=\(name) reason=\(disableReason.rawValue)")
@@ -707,14 +727,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try restoreManager.register(shortcuts.restore, id: 2)
             try formFillManager.register(shortcuts.formFill, id: 3)
             try quickMenuManager.register(shortcuts.quickMenu, id: 4)
-            switch shortcuts.voiceTrigger {
-            case .commandShift(let key):
-                try voiceManager.register(HotKeyShortcut(key: key), id: 5)
-            case .fnCommand:
-                try voiceManager.register(modifierChord: [.maskSecondaryFn, .maskCommand], id: 5)
-            case .commandSpace:
-                try voiceManager.register(keyCode: VoiceTrigger.commandSpaceKeyCode, modifiers: VoiceTrigger.commandSpaceModifiers, id: 5)
-            }
+            try voiceManager.register(shortcuts.voiceTrigger, id: 5)
 
             // Stage all five taps before touching the active set. If any one tap
             // fails, the candidate set is fully released and the previous set stays
@@ -734,6 +747,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             lastHotKeyRecoveryDescription = "登録完了（\(reason)）"
             mayRetryMissingRegistration = true
             AppLog.write("global hotkeys registered rewrite=\(shortcuts.rewrite.displayName) restore=\(shortcuts.restore.displayName) form=\(shortcuts.formFill.displayName) menu=\(shortcuts.quickMenu.displayName) voice=\(shortcuts.voiceTrigger.displayName)")
+            return nil
         } catch {
             for (_, candidate) in candidates {
                 candidate.unregister()
@@ -742,9 +756,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             lastHotKeyRecoveryDescription = "登録失敗（\(reason)）"
             mayRetryMissingRegistration = false
             AppLog.write("global hotkey registration failed reason=\(reason): \(error.localizedDescription)")
-            if reason != "watchdog-missing" && reason != "app-switch-missing" {
+            if presentsAlert && reason != "watchdog-missing" && reason != "app-switch-missing" {
                 controller.presentError(error, showAlert: true)
             }
+            return error.localizedDescription
         }
     }
 
@@ -1061,39 +1076,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updateShortcutMenuItems() {
-        rewriteMenuItem?.keyEquivalent = controller.shortcuts.rewrite.keyEquivalent
-        restoreMenuItem?.keyEquivalent = controller.shortcuts.restore.keyEquivalent
-        formFillMenuItem?.keyEquivalent = controller.shortcuts.formFill.keyEquivalent
-        quickMenuItem?.keyEquivalent = controller.shortcuts.quickMenu.keyEquivalent
-        for item in [rewriteMenuItem, restoreMenuItem, formFillMenuItem, quickMenuItem].compactMap({ $0 }) {
-            item.keyEquivalentModifierMask = [.command, .shift]
+        if let rewriteMenuItem {
+            applyMenuShortcut(controller.shortcuts.rewrite, to: rewriteMenuItem)
+        }
+        if let restoreMenuItem {
+            applyMenuShortcut(controller.shortcuts.restore, to: restoreMenuItem)
+        }
+        if let formFillMenuItem {
+            applyMenuShortcut(controller.shortcuts.formFill, to: formFillMenuItem)
+        }
+        if let quickMenuItem {
+            applyMenuShortcut(controller.shortcuts.quickMenu, to: quickMenuItem)
         }
         if let voiceMenuItem {
             applyVoiceMenuShortcut(to: voiceMenuItem)
         }
     }
 
+    private func applyMenuShortcut(_ shortcut: HotKeyShortcut, to item: NSMenuItem) {
+        item.keyEquivalent = shortcut.keyEquivalent
+        var mask: NSEvent.ModifierFlags = []
+        if shortcut.modifiers.contains(.control) { mask.insert(.control) }
+        if shortcut.modifiers.contains(.option) { mask.insert(.option) }
+        if shortcut.modifiers.contains(.command) { mask.insert(.command) }
+        if shortcut.modifiers.contains(.shift) { mask.insert(.shift) }
+        item.keyEquivalentModifierMask = mask
+    }
+
     private func applyVoiceMenuShortcut(to item: NSMenuItem) {
         let trigger = controller.shortcuts.voiceTrigger
         item.title = voiceMenuTitle(for: trigger)
         switch trigger {
-        case .commandShift(let key):
-            item.keyEquivalent = key.keyEquivalent
-            item.keyEquivalentModifierMask = [.command, .shift]
-        case .fnCommand:
+        case .key(let shortcut):
+            applyMenuShortcut(shortcut, to: item)
+        case .modifierChord:
             item.keyEquivalent = ""
             item.keyEquivalentModifierMask = []
-        case .commandSpace:
-            item.keyEquivalent = " "
-            item.keyEquivalentModifierMask = [.command]
         }
     }
 
-    private func voiceMenuTitle(for trigger: VoiceTrigger) -> String {
+    private func voiceMenuTitle(for trigger: ShortcutTrigger) -> String {
         switch trigger {
-        case .commandShift:
+        case .key(let shortcut) where !shortcut.keyEquivalent.isEmpty:
             "音声入力 開始 / 確定"
-        case .fnCommand, .commandSpace:
+        case .key, .modifierChord:
             "音声入力 開始 / 確定 \(trigger.displayName)"
         }
     }

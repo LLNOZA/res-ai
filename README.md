@@ -111,8 +111,8 @@ Build both release artifacts:
 The generated installers are written to:
 
 ```text
-dist/installer/ResponseAi-0.4.0.pkg
-dist/installer/ResponseAi-0.4.0.dmg
+dist/installer/ResponseAi-0.4.1.pkg
+dist/installer/ResponseAi-0.4.1.dmg
 ```
 
 If a `Developer ID Application` certificate is installed, `scripts/build_app.sh` uses it for the app bundle and `scripts/build_dmg.sh` signs the DMG. If a `Developer ID Installer` certificate is installed, `scripts/build_pkg.sh` signs the installer package. Without those certificates, the scripts still build unsigned local-testing installers.
@@ -140,8 +140,8 @@ RESAI_NOTARIZE=1 \
 You can also notarize one artifact directly:
 
 ```bash
-./scripts/notarize_pkg.sh dist/installer/ResponseAi-0.4.0.pkg
-./scripts/notarize_dmg.sh dist/installer/ResponseAi-0.4.0.dmg
+./scripts/notarize_pkg.sh dist/installer/ResponseAi-0.4.1.pkg
+./scripts/notarize_dmg.sh dist/installer/ResponseAi-0.4.1.dmg
 ```
 
 On first app run, use `ResponseAi > アクセシビリティ／入力監視を開く` (or the `操作権限` button in Settings), then grant Accessibility and Input Monitoring permission to `ResponseAi`:
@@ -204,7 +204,7 @@ Command + Shift + K
 
 The first press previews the fields ResponseAi can fill. Press the same shortcut again within 20 seconds to apply the values. It skips existing values, passwords, payment fields, authentication codes, and consent-like fields, and it never presses Submit.
 
-Shortcut keys can be changed from `Settings > Shortcuts`. Command + Shift stays fixed; the letter key can be changed for Voice, Rewrite, Restore, Form Fill, and Quick Menu.
+Shortcuts can be changed from `Settings > Shortcuts` for Voice, Rewrite, Restore, Form Fill, and Quick Menu. Click a field and press the combination you want (any of Command / Option / Control / Shift plus a letter, number, symbol, Space, arrow, or F-key; F1–F12 also work alone). Escape cancels recording, and each row (or all rows) can be reset to the defaults. Voice input alone also accepts a modifier-only combination such as `fn + Command`. Combinations without a modifier, Shift plus a character, duplicates, common system shortcuts (Command + Q / W / C / V / X / Z / A / S, Command + Tab, Command + Space, Control + Space, Command + Shift + 3 / 4 / 5, and others), and combinations that cannot be registered are refused with the reason shown. Settings saved by 0.4.0 and earlier are read as the same shortcuts.
 
 The menu bar item also has manual Rewrite, Restore, Fill Form, Mode, Settings, and permission commands.
 
@@ -303,7 +303,7 @@ RESAI_DISABLE_BUNDLED_PROXY=1 ./scripts/run_app.sh
 - Voice input on macOS 14+ (SpeechAnalyzer on macOS 26+, SFSpeechRecognizer fallback earlier; press to start / press to confirm, optional hold-to-talk, Escape to cancel, on-device transcription plus optional AI cleanup via the Claude API directly, the Cloud Run proxy during migration, or a Gemini API key fallback)
 - Restore-last-draft hotkey (also reverts the last voice cleanup within 60 seconds)
 - Profile-based form-fill hotkey with preview-before-fill confirmation
-- Configurable Command+Shift shortcut keys for Rewrite, Restore, and Form Fill
+- Recordable shortcuts (any modifier combination) for Voice, Rewrite, Restore, Form Fill, and Quick Menu
 - Lightweight HUD
 - Quick mode menu
 - Accessibility permission prompt

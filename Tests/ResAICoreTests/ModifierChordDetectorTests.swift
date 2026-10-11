@@ -60,6 +60,40 @@ final class ModifierChordDetectorTests: XCTestCase {
         XCTAssertEqual(detector.handle(flags: chord, at: 1.02), .pressed)
     }
 
+    // MARK: Recorded modifier-only voice triggers
+
+    func testRecordedChordFiresWhenPressedAloneAndReleased() {
+        for modifiers: ShortcutModifiers in [[.function, .command], [.command, .shift], [.function, .option, .control]] {
+            var detector = ModifierChordDetector(requiredFlags: modifiers.eventFlags)
+            let flags = modifiers.eventFlags
+
+            XCTAssertEqual(detector.handle(flags: flags, at: 1.0), .pressed, "\(modifiers)")
+            XCTAssertEqual(detector.handle(flags: [], at: 1.4), .released, "\(modifiers)")
+        }
+    }
+
+    func testRecordedChordDoesNotFireWhenOrdinaryKeyIsPressedDuringTheChord() {
+        let modifiers: ShortcutModifiers = [.command, .shift]
+        var detector = ModifierChordDetector(requiredFlags: modifiers.eventFlags)
+
+        // ⌘ down, T down, ⇧ down (⌘⇧T typed while building the chord).
+        XCTAssertEqual(detector.handle(flags: [.maskCommand], at: 1.0), .none)
+        XCTAssertEqual(detector.handleNonModifierKeyDown(at: 1.05), .none)
+        XCTAssertEqual(detector.handle(flags: modifiers.eventFlags, at: 1.10), .none)
+        detector.handleNonModifierKeyUp()
+        XCTAssertEqual(detector.handle(flags: [], at: 1.20), .none)
+    }
+
+    func testRecordedChordIsWithdrawnWhenOrdinaryKeyFollowsQuickly() {
+        let modifiers: ShortcutModifiers = [.command, .shift]
+        var detector = ModifierChordDetector(requiredFlags: modifiers.eventFlags)
+
+        XCTAssertEqual(detector.handle(flags: modifiers.eventFlags, at: 1.0), .pressed)
+        XCTAssertEqual(detector.handleNonModifierKeyDown(at: 1.05), .released)
+        detector.handleNonModifierKeyUp()
+        XCTAssertEqual(detector.handle(flags: [], at: 1.20), .none)
+    }
+
     func testResetReportsHeldChordAndClearsDebounceAndExtraKeyState() {
         var detector = ModifierChordDetector(requiredFlags: chord)
 

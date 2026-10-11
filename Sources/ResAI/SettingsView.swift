@@ -109,9 +109,6 @@ struct SettingsView: View {
         .onChange(of: controller.userProfileEnabled) { _, _ in
             controller.saveUserProfile()
         }
-        .onChange(of: controller.shortcuts) { _, _ in
-            controller.saveShortcuts(showHUD: false)
-        }
         .onChange(of: voiceInput.settings) { _, _ in
             voiceInput.saveSettings()
         }
@@ -426,63 +423,86 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
 
             Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 9) {
-                GridRow {
-                    Text("音声入力")
-                        .foregroundStyle(.secondary)
-                    VStack(alignment: .leading, spacing: 6) {
-                        Picker("音声トリガー", selection: voiceTriggerKind) {
-                            Text("⌘ + ⇧ + キー").tag(VoiceTriggerKind.commandShift)
-                            Text("fn + ⌘").tag(VoiceTriggerKind.fnCommand)
-                            Text("⌘ + Space").tag(VoiceTriggerKind.commandSpace)
-                        }
-                        .labelsHidden()
-                        .pickerStyle(.segmented)
-                        .frame(maxWidth: 280)
-
-                        if case .commandShift = controller.shortcuts.voiceTrigger {
-                            shortcutPicker(selection: voiceKeyBinding)
-                        }
-
-                        if case .fnCommand = controller.shortcuts.voiceTrigger {
-                            Text("システム設定 > キーボード >「🌐 キーを押して」を「何もしない」にしてください（音声入力/絵文字が開くのを防ぐため）")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-
-                        if case .commandSpace = controller.shortcuts.voiceTrigger {
-                            Text("Spotlight と競合します。システム設定 > キーボード > キーボードショートカット > Spotlight で「Spotlight 検索を表示」をオフにするか別のキーに変えてください。入力ソース切替を ⌘Space にしている場合も同様です。")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
+                ForEach(ShortcutAction.allCases) { action in
+                    GridRow {
+                        Text(action.displayName)
+                            .foregroundStyle(.secondary)
+                        shortcutRow(action)
                     }
-                }
-                GridRow {
-                    Text("返信")
-                        .foregroundStyle(.secondary)
-                    shortcutPicker(selection: $controller.shortcuts.rewrite.key)
-                }
-                GridRow {
-                    Text("復元")
-                        .foregroundStyle(.secondary)
-                    shortcutPicker(selection: $controller.shortcuts.restore.key)
-                }
-                GridRow {
-                    Text("フォーム")
-                        .foregroundStyle(.secondary)
-                    shortcutPicker(selection: $controller.shortcuts.formFill.key)
-                }
-                GridRow {
-                    Text("メニュー")
-                        .foregroundStyle(.secondary)
-                    shortcutPicker(selection: $controller.shortcuts.quickMenu.key)
                 }
             }
 
-            Text("⌘ + ⇧ は固定です。キーだけ変更できます。")
+            Text("欄をクリックして、使いたいキーの組み合わせを押してください。Esc で中止。修飾キー（⌘ ⌥ ⌃ ⇧）と一緒に押します（F1〜F12 は単独でも可）。音声入力だけは修飾キーのみ（例: fn + ⌘）も登録できます。")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 10) {
+                Button {
+                    controller.resetAllShortcuts()
+                } label: {
+                    Label("すべて標準に戻す", systemImage: "arrow.counterclockwise")
+                }
+                .disabled(controller.shortcuts == .defaults)
+
+                if let error = controller.shortcutResetError {
+                    Text(error)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private func shortcutRow(_ action: ShortcutAction) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                ShortcutRecorderField(
+                    displayName: controller.shortcuts.trigger(for: action).displayName,
+                    isRecording: controller.recordingShortcutAction == action,
+                    onStart: { controller.beginRecordingShortcut(action) },
+                    onCapture: { controller.finishRecordingShortcut($0, for: action) },
+                    onCancel: { controller.cancelRecordingShortcut(action) }
+                )
+
+                Button {
+                    controller.resetShortcut(action)
+                } label: {
+                    Image(systemName: "arrow.counterclockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("標準に戻す（\(AppShortcuts.defaults.trigger(for: action).displayName)）")
+                .disabled(controller.shortcuts.isDefault(action))
+            }
+
+            if let error = controller.shortcutErrors[action] {
+                Text(error)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if action == .voice, let note = voiceTriggerNote {
+                Text(note)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// System settings the current voice trigger depends on.
+    private var voiceTriggerNote: String? {
+        switch controller.shortcuts.voiceTrigger {
+        case .modifierChord(let modifiers) where modifiers.contains(.function):
+            "システム設定 > キーボード >「🌐 キーを押して」を「何もしない」にしてください（音声入力/絵文字が開くのを防ぐため）"
+        case .modifierChord:
+            "修飾キーを押した瞬間に反応します。この組み合わせで始まる他のショートカットを押したときにも反応することがあります。"
+        case .key(let shortcut) where ReservedShortcut.matching(shortcut) != nil:
+            "Spotlight などのシステムのショートカットと競合します。システム設定 > キーボード > キーボードショートカットで該当する項目をオフにするか、別のキーを登録してください。"
+        case .key:
+            nil
         }
     }
 
@@ -605,72 +625,6 @@ struct SettingsView: View {
                 .background(Color.secondary.opacity(0.08))
                 .clipShape(RoundedRectangle(cornerRadius: 6))
         }
-    }
-
-    private enum VoiceTriggerKind: String, Hashable {
-        case commandShift
-        case fnCommand
-        case commandSpace
-    }
-
-    private var voiceTriggerKind: Binding<VoiceTriggerKind> {
-        Binding(
-            get: {
-                switch controller.shortcuts.voiceTrigger {
-                case .fnCommand: .fnCommand
-                case .commandShift: .commandShift
-                case .commandSpace: .commandSpace
-                }
-            },
-            set: { kind in
-                switch kind {
-                case .fnCommand:
-                    controller.shortcuts.voiceTrigger = .fnCommand
-                case .commandSpace:
-                    controller.shortcuts.voiceTrigger = .commandSpace
-                case .commandShift:
-                    controller.shortcuts.voiceTrigger = .commandShift(controller.shortcuts.voice.key)
-                }
-            }
-        )
-    }
-
-    private var voiceKeyBinding: Binding<HotKeyKey> {
-        Binding(
-            get: { controller.shortcuts.voice.key },
-            set: { key in
-                controller.shortcuts.voice = HotKeyShortcut(key: key)
-                controller.shortcuts.voiceTrigger = .commandShift(key)
-            }
-        )
-    }
-
-    private func shortcutPicker(selection: Binding<HotKeyKey>) -> some View {
-        Picker("ショートカット", selection: selection) {
-            ForEach(HotKeyKey.allCases) { key in
-                Text("⌘ + ⇧ + \(key.displayName)")
-                    .tag(key)
-                    .disabled(isShortcutKeyUsed(key, except: selection.wrappedValue))
-            }
-        }
-        .labelsHidden()
-        .pickerStyle(.menu)
-    }
-
-    private func isShortcutKeyUsed(_ key: HotKeyKey, except current: HotKeyKey) -> Bool {
-        guard key != current else {
-            return false
-        }
-        if controller.shortcuts.rewrite.key == key
-            || controller.shortcuts.restore.key == key
-            || controller.shortcuts.formFill.key == key
-            || controller.shortcuts.quickMenu.key == key {
-            return true
-        }
-        if case .commandShift = controller.shortcuts.voiceTrigger {
-            return controller.shortcuts.voice.key == key
-        }
-        return false
     }
 
     private var connectionSection: some View {

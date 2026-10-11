@@ -22,4 +22,17 @@ public enum HotKeyModifierMatcher {
     public static func matches(eventFlags: CGEventFlags, requiredFlags: CGEventFlags) -> Bool {
         eventFlags.intersection(relevantFlags) == requiredFlags.intersection(relevantFlags)
     }
+
+    /// Arrow, navigation, and F-keys arrive with the fn flag set by macOS itself,
+    /// so fn is not treated as an extra modifier for those keys.
+    public static func matches(eventFlags: CGEventFlags, requiredFlags: CGEventFlags, keyCode: UInt32) -> Bool {
+        guard KeyCodeNames.impliesFunctionFlag(keyCode) else {
+            return matches(eventFlags: eventFlags, requiredFlags: requiredFlags)
+        }
+        var event = eventFlags
+        var required = requiredFlags
+        event.remove(.maskSecondaryFn)
+        required.remove(.maskSecondaryFn)
+        return matches(eventFlags: event, requiredFlags: required)
+    }
 }
