@@ -83,24 +83,95 @@ final class AudioLevelBridge: @unchecked Sendable {
     }
 }
 
+/// Whether the input node's formats can be tapped. `installTap` with a format whose
+/// sample rate differs from the hardware, or with 0 Hz / 0 channels, raises an
+/// Objective-C exception that ends the process, so every such case becomes an error.
+enum MicrophoneFormatCheck: Equatable, Sendable {
+    case ok
+    /// No usable input (no device, Bluetooth profile switching, 0 Hz, 0 channels).
+    case unavailable
+    /// The node still reports the previous device's format.
+    case mismatch
+
+    static func check(
+        hardwareSampleRate: Double,
+        hardwareChannels: UInt32,
+        tapSampleRate: Double,
+        tapChannels: UInt32
+    ) -> MicrophoneFormatCheck {
+        guard hardwareSampleRate > 0, hardwareChannels > 0,
+              tapSampleRate > 0, tapChannels > 0 else {
+            return .unavailable
+        }
+        return hardwareSampleRate == tapSampleRate ? .ok : .mismatch
+    }
+}
+
+/// The microphone side of a dictation engine, replaceable in tests.
+@MainActor
+protocol AudioCapturing: AnyObject {
+    var audioLevelBridge: AudioLevelBridge { get }
+    /// Called when capture stopped by itself (input device changed and could not be resumed).
+    var onInterrupted: ((Error) -> Void)? { get set }
+    func start(outputFormat: AVAudioFormat, onBuffer: @escaping @Sendable (AVAudioPCMBuffer) -> Void) throws
+    func stop()
+}
+
 /// Shared microphone tap used by SpeechAnalyzer and SFSpeechRecognizer engines.
 /// The tap block runs on the audio render queue and must not capture MainActor state.
 @MainActor
-final class MicrophoneCapture {
-    private let audioEngine = AVAudioEngine()
+final class MicrophoneCapture: AudioCapturing {
+    private var audioEngine = AVAudioEngine()
     private var tapInstalled = false
+    /// Set after `AVAudioEngineConfigurationChange`: the engine keeps the old device's
+    /// format, so the next start builds a fresh engine.
+    private var needsNewEngine = false
+    private var configurationObserver: NSObjectProtocol?
+    private var activeOutputFormat: AVAudioFormat?
+    private var activeOnBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
+    private var configurationRestarts = 0
     let audioLevelBridge = AudioLevelBridge()
+    var onInterrupted: ((Error) -> Void)?
+
+    private static let maxConfigurationRestarts = 3
 
     func start(
         outputFormat: AVAudioFormat,
         onBuffer: @escaping @Sendable (AVAudioPCMBuffer) -> Void
     ) throws {
-        let inputNode = audioEngine.inputNode
-        audioEngine.prepare()
-        let inputFormat = inputNode.outputFormat(forBus: 0)
-        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
-            throw SpeechDictationError.audioEngineFailed("Microphone input format is unavailable.")
+        configurationRestarts = 0
+        try startEngine(outputFormat: outputFormat, onBuffer: onBuffer)
+    }
+
+    private func startEngine(
+        outputFormat: AVAudioFormat,
+        onBuffer: @escaping @Sendable (AVAudioPCMBuffer) -> Void
+    ) throws {
+        // A second tap on bus 0 raises an exception, so a double start restarts instead.
+        if tapInstalled || audioEngine.isRunning {
+            stop()
         }
+        if needsNewEngine {
+            replaceEngine()
+        }
+
+        audioEngine.prepare()
+        if formatCheck() == .mismatch {
+            replaceEngine()
+            audioEngine.prepare()
+        }
+        switch formatCheck() {
+        case .ok:
+            break
+        case .unavailable:
+            throw SpeechDictationError.audioEngineFailed("マイク入力が見つかりません。入力装置を確認してください。")
+        case .mismatch:
+            needsNewEngine = true
+            throw SpeechDictationError.audioDeviceChanged
+        }
+
+        let inputNode = audioEngine.inputNode
+        let inputFormat = inputNode.outputFormat(forBus: 0)
         guard let converter = SpeechTapConverter(from: inputFormat, to: outputFormat) else {
             throw SpeechDictationError.audioEngineFailed("Could not convert microphone audio to the analyzer format.")
         }
@@ -129,15 +200,75 @@ final class MicrophoneCapture {
             }
             throw SpeechDictationError.audioEngineFailed(error.localizedDescription)
         }
+        activeOutputFormat = outputFormat
+        activeOnBuffer = onBuffer
+        observeConfigurationChanges()
     }
 
     func stop() {
+        activeOutputFormat = nil
+        activeOnBuffer = nil
         if tapInstalled {
             audioEngine.inputNode.removeTap(onBus: 0)
             tapInstalled = false
         }
         if audioEngine.isRunning {
             audioEngine.stop()
+        }
+    }
+
+    private func formatCheck() -> MicrophoneFormatCheck {
+        let inputNode = audioEngine.inputNode
+        let hardware = inputNode.inputFormat(forBus: 0)
+        let tap = inputNode.outputFormat(forBus: 0)
+        return MicrophoneFormatCheck.check(
+            hardwareSampleRate: hardware.sampleRate,
+            hardwareChannels: hardware.channelCount,
+            tapSampleRate: tap.sampleRate,
+            tapChannels: tap.channelCount
+        )
+    }
+
+    private func replaceEngine() {
+        if let configurationObserver {
+            NotificationCenter.default.removeObserver(configurationObserver)
+            self.configurationObserver = nil
+        }
+        audioEngine = AVAudioEngine()
+        needsNewEngine = false
+    }
+
+    private func observeConfigurationChanges() {
+        guard configurationObserver == nil else { return }
+        // Posted on an arbitrary thread; hop to the main actor before touching the engine.
+        configurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: audioEngine,
+            queue: nil
+        ) { @Sendable [weak self] _ in
+            Task { @MainActor in
+                self?.handleConfigurationChange()
+            }
+        }
+    }
+
+    /// Input device or sample-rate change (Bluetooth headset connecting, the mic
+    /// switching AirPods to the headset profile, ...). The engine has already stopped;
+    /// resume on a fresh engine, or report the interruption instead of crashing.
+    private func handleConfigurationChange() {
+        needsNewEngine = true
+        guard tapInstalled, let outputFormat = activeOutputFormat, let onBuffer = activeOnBuffer else {
+            return
+        }
+        configurationRestarts += 1
+        do {
+            guard configurationRestarts <= Self.maxConfigurationRestarts else {
+                throw SpeechDictationError.audioDeviceChanged
+            }
+            try startEngine(outputFormat: outputFormat, onBuffer: onBuffer)
+        } catch {
+            stop()
+            onInterrupted?(error)
         }
     }
 }

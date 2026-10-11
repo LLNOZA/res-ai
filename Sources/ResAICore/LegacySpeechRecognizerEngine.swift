@@ -3,6 +3,59 @@ import Foundation
 import os
 import Speech
 
+/// One recognition callback, reduced to Sendable values before it leaves the Speech queue.
+struct LegacyRecognitionEvent: Equatable, Sendable {
+    var text: String?
+    var isFinal: Bool
+    var errorDescription: String?
+
+    init(text: String? = nil, isFinal: Bool = false, errorDescription: String? = nil) {
+        self.text = text
+        self.isFinal = isFinal
+        self.errorDescription = errorDescription
+    }
+}
+
+@MainActor
+protocol LegacyRecognitionTasking: AnyObject {
+    func cancel()
+}
+
+@MainActor
+protocol LegacySpeechRecognizing: AnyObject {
+    var isAvailable: Bool { get }
+    var supportsOnDeviceRecognition: Bool { get }
+    func startTask(
+        request: SFSpeechAudioBufferRecognitionRequest,
+        handler: @escaping @MainActor @Sendable (LegacyRecognitionEvent) -> Void
+    ) -> any LegacyRecognitionTasking
+}
+
+/// System services the macOS 14/15 engine depends on. Tests replace every member so the
+/// legacy path runs on any OS without the microphone, TCC prompts, or Speech servers.
+@MainActor
+struct LegacySpeechServices {
+    var speechAuthorizationStatus: () -> SFSpeechRecognizerAuthorizationStatus
+    var requestSpeechAuthorization: () async -> SFSpeechRecognizerAuthorizationStatus
+    var microphoneGranted: () -> Bool
+    var requestMicrophone: () async -> Bool
+    var makeRecognizer: (Locale) -> (any LegacySpeechRecognizing)?
+    var makeCapture: () -> any AudioCapturing
+
+    static var live: LegacySpeechServices {
+        LegacySpeechServices(
+            speechAuthorizationStatus: { SFSpeechRecognizer.authorizationStatus() },
+            requestSpeechAuthorization: { await requestSystemSpeechAuthorization() },
+            microphoneGranted: { MicrophonePermission.status() == .granted },
+            requestMicrophone: { await MicrophonePermission.request() },
+            makeRecognizer: { locale in
+                SFSpeechRecognizer(locale: locale).map { SystemSpeechRecognizer($0) }
+            },
+            makeCapture: { MicrophoneCapture() }
+        )
+    }
+}
+
 /// On-device-preferred dictation via `SFSpeechRecognizer`, used on macOS < 26.
 @MainActor
 public final class LegacySpeechRecognizerEngine: SpeechDictating {
@@ -11,8 +64,8 @@ public final class LegacySpeechRecognizerEngine: SpeechDictating {
     public var isReady: Bool {
         !isRunning
             && !stopping
-            && SFSpeechRecognizer.authorizationStatus() == .authorized
-            && MicrophonePermission.status() == .granted
+            && services.speechAuthorizationStatus() == .authorized
+            && services.microphoneGranted()
             && recognizer?.isAvailable == true
     }
     public var onTranscriptUpdate: ((DictationTranscript) -> Void)?
@@ -20,10 +73,15 @@ public final class LegacySpeechRecognizerEngine: SpeechDictating {
     public var onAudioLevel: ((Float) -> Void)?
     public var onError: ((Error) -> Void)?
 
-    private let capture = MicrophoneCapture()
+    /// A permanent failure (Dictation off, on-device assets missing) fails every
+    /// request immediately; without a cap the restart loop never ends.
+    static let maxConsecutiveRecognitionErrors = 3
+
+    private let services: LegacySpeechServices
+    private let capture: any AudioCapturing
     private let requestBox = SpeechAudioRequestBox()
-    private var recognizer: SFSpeechRecognizer?
-    private var recognitionTask: SFSpeechRecognitionTask?
+    private var recognizer: (any LegacySpeechRecognizing)?
+    private var recognitionTask: (any LegacyRecognitionTasking)?
     private var transcript = DictationTranscript()
     private var audioSmoother = AudioLevelSmoother()
     private var preparedLocaleIdentifier: String?
@@ -31,29 +89,47 @@ public final class LegacySpeechRecognizerEngine: SpeechDictating {
     private var sessionGeneration = 0
     private var startAttemptID: UInt64 = 0
     private var stopping = false
+    private var consecutiveRecognitionErrors = 0
     private var stopWaiter: (generation: Int, continuation: CheckedContinuation<DictationTranscript, Never>)?
     private var stopTimeoutTask: Task<Void, Never>?
     private var didLogServerFallback = false
     private let logger = Logger(subsystem: "ai.res.resai", category: "Speech")
 
-    public init() {}
+    public convenience init() {
+        self.init(services: .live)
+    }
+
+    init(services: LegacySpeechServices) {
+        self.services = services
+        self.capture = services.makeCapture()
+    }
+
+    /// True while `stop()` waits for the recognizer's final result.
+    var isAwaitingFinalResult: Bool { stopWaiter != nil }
 
     public func prepare(locale: Locale) async throws {
         try Task.checkCancellation()
         if isPrepared(for: locale),
-           SFSpeechRecognizer.authorizationStatus() == .authorized,
-           MicrophonePermission.status() == .granted {
+           services.speechAuthorizationStatus() == .authorized,
+           services.microphoneGranted() {
             return
         }
 
-        try Task.checkCancellation()
-        let speechStatus = await requestSpeechAuthorization()
-        guard speechStatus == .authorized else {
-            throw SpeechDictationError.assetsUnavailable("Speech recognition was denied.")
+        switch services.speechAuthorizationStatus() {
+        case .authorized:
+            break
+        case .denied, .restricted:
+            // Asking again shows nothing; only System Settings can change it.
+            throw SpeechDictationError.speechRecognitionDenied
+        default:
+            let speechStatus = await services.requestSpeechAuthorization()
+            guard speechStatus == .authorized else {
+                throw SpeechDictationError.speechRecognitionDenied
+            }
         }
         try Task.checkCancellation()
 
-        let granted = await MicrophonePermission.request()
+        let granted = await services.requestMicrophone()
         guard granted else { throw SpeechDictationError.microphoneDenied }
         try Task.checkCancellation()
 
@@ -115,11 +191,16 @@ public final class LegacySpeechRecognizerEngine: SpeechDictating {
         transcript = DictationTranscript()
         onTranscriptUpdate?(transcript)
         stopping = false
+        consecutiveRecognitionErrors = 0
 
         audioSmoother = AudioLevelSmoother()
         capture.audioLevelBridge.reset()
         capture.audioLevelBridge.publish = { [weak self] mapped in
             self?.publishSmoothedLevel(mapped, generation: generation)
+        }
+        capture.onInterrupted = { [weak self] error in
+            guard let self, self.isRunning, self.sessionGeneration == generation else { return }
+            self.failSession(error)
         }
 
         let format = try recognitionFormat()
@@ -143,36 +224,35 @@ public final class LegacySpeechRecognizerEngine: SpeechDictating {
         let request = makeRequest(recognizer: recognizer)
         requestBox.attach(request)
 
-        recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            let text = result?.bestTranscription.formattedString
-            let isFinal = result?.isFinal ?? false
-            let hasError = error != nil
-            Task { @MainActor [weak self] in
-                self?.handleRecognition(
-                    text: text,
-                    isFinal: isFinal,
-                    hasError: hasError,
-                    generation: generation
-                )
-            }
+        recognitionTask = recognizer.startTask(request: request) { [weak self] event in
+            self?.handleRecognition(event, generation: generation)
         }
     }
 
-    private func handleRecognition(text: String?, isFinal: Bool, hasError: Bool, generation: Int) {
+    private func handleRecognition(_ event: LegacyRecognitionEvent, generation: Int) {
         guard generation == recognitionGeneration else { return }
 
-        if hasError {
+        if let errorDescription = event.errorDescription {
             if stopping {
                 completeStop(generation: sessionGeneration)
             } else if isRunning {
-                restartRecognition()
+                consecutiveRecognitionErrors += 1
+                logger.error("SFSpeechRecognizer request failed count=\(self.consecutiveRecognitionErrors, privacy: .public): \(errorDescription, privacy: .public)")
+                if consecutiveRecognitionErrors >= Self.maxConsecutiveRecognitionErrors {
+                    failSession(SpeechDictationError.recognitionFailed(errorDescription))
+                } else {
+                    restartRecognition()
+                }
             }
             return
         }
 
-        guard let text else { return }
+        guard let text = event.text else { return }
+        if !text.isEmpty {
+            consecutiveRecognitionErrors = 0
+        }
 
-        if isFinal {
+        if event.isFinal {
             if !text.isEmpty {
                 transcript.finalizedText += text
                 transcript.volatileText = ""
@@ -208,6 +288,11 @@ public final class LegacySpeechRecognizerEngine: SpeechDictating {
 
     private func waitForFinalResult(timeoutSeconds: TimeInterval, generation: Int) async -> DictationTranscript {
         await withCheckedContinuation { continuation in
+            // Never drop a waiter without resuming it.
+            if let previous = stopWaiter {
+                stopWaiter = nil
+                previous.continuation.resume(returning: transcript)
+            }
             stopTimeoutTask?.cancel()
             stopWaiter = (generation: generation, continuation: continuation)
             stopTimeoutTask = Task { @MainActor [weak self] in
@@ -218,6 +303,8 @@ public final class LegacySpeechRecognizerEngine: SpeechDictating {
         }
     }
 
+    /// The only resume points are here and `tearDownRecognition`; both clear
+    /// `stopWaiter` first, so a continuation is resumed exactly once.
     private func completeStop(generation: Int) {
         guard let stopWaiter, stopWaiter.generation == generation else { return }
         self.stopWaiter = nil
@@ -238,8 +325,12 @@ public final class LegacySpeechRecognizerEngine: SpeechDictating {
     }
 
     private func attachRecognizer(locale: Locale) throws {
-        guard let recognizer = SFSpeechRecognizer(locale: locale), recognizer.isAvailable else {
+        guard let recognizer = services.makeRecognizer(locale) else {
             throw SpeechDictationError.localeUnsupported(locale.identifier)
+        }
+        // Siri/Dictation turned off or no network for a server-only locale.
+        guard recognizer.isAvailable else {
+            throw SpeechDictationError.recognizerUnavailable(locale.identifier)
         }
         self.recognizer = recognizer
         preparedLocaleIdentifier = locale.identifier
@@ -248,7 +339,7 @@ public final class LegacySpeechRecognizerEngine: SpeechDictating {
         }
     }
 
-    private func makeRequest(recognizer: SFSpeechRecognizer) -> SFSpeechAudioBufferRecognitionRequest {
+    private func makeRequest(recognizer: any LegacySpeechRecognizing) -> SFSpeechAudioBufferRecognitionRequest {
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         request.taskHint = .dictation
@@ -286,14 +377,6 @@ public final class LegacySpeechRecognizerEngine: SpeechDictating {
             && preparedLocaleIdentifier == locale.identifier
     }
 
-    private func requestSpeechAuthorization() async -> SFSpeechRecognizerAuthorizationStatus {
-        await withCheckedContinuation { continuation in
-            SFSpeechRecognizer.requestAuthorization { status in
-                continuation.resume(returning: status)
-            }
-        }
-    }
-
     private func tearDownRecognition() {
         recognitionGeneration += 1
         recognitionTask?.cancel()
@@ -312,9 +395,64 @@ public final class LegacySpeechRecognizerEngine: SpeechDictating {
         sessionGeneration += 1
         isRunning = false
         stopping = false
+        capture.onInterrupted = nil
         capture.stop()
         tearDownRecognition()
         transcript = DictationTranscript()
+    }
+}
+
+/// `SFSpeechRecognizer.requestAuthorization` calls back on an arbitrary queue. Kept
+/// nonisolated with an explicit `@Sendable` handler: a MainActor-inherited closure
+/// trips Swift 6's runtime isolation check and the process traps on macOS 14/15.
+private func requestSystemSpeechAuthorization() async -> SFSpeechRecognizerAuthorizationStatus {
+    await withCheckedContinuation { continuation in
+        SFSpeechRecognizer.requestAuthorization { @Sendable status in
+            continuation.resume(returning: status)
+        }
+    }
+}
+
+@MainActor
+private final class SystemSpeechRecognizer: LegacySpeechRecognizing {
+    private let recognizer: SFSpeechRecognizer
+
+    init(_ recognizer: SFSpeechRecognizer) {
+        self.recognizer = recognizer
+    }
+
+    var isAvailable: Bool { recognizer.isAvailable }
+    var supportsOnDeviceRecognition: Bool { recognizer.supportsOnDeviceRecognition }
+
+    func startTask(
+        request: SFSpeechAudioBufferRecognitionRequest,
+        handler: @escaping @MainActor @Sendable (LegacyRecognitionEvent) -> Void
+    ) -> any LegacyRecognitionTasking {
+        // `@Sendable` keeps the result handler nonisolated whatever queue Speech uses.
+        let task = recognizer.recognitionTask(with: request) { @Sendable result, error in
+            let event = LegacyRecognitionEvent(
+                text: result?.bestTranscription.formattedString,
+                isFinal: result?.isFinal ?? false,
+                errorDescription: error?.localizedDescription
+            )
+            Task { @MainActor in
+                handler(event)
+            }
+        }
+        return SystemRecognitionTask(task)
+    }
+}
+
+@MainActor
+private final class SystemRecognitionTask: LegacyRecognitionTasking {
+    private let task: SFSpeechRecognitionTask
+
+    init(_ task: SFSpeechRecognitionTask) {
+        self.task = task
+    }
+
+    func cancel() {
+        task.cancel()
     }
 }
 

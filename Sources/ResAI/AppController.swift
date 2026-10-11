@@ -62,17 +62,35 @@ final class AppController: ObservableObject {
         permissionManager.hotKeyPermissionState == .granted
     }
 
+    /// Settings, Keychain, clipboard, and System Settings access. Isolated in tests.
+    let environment: AppEnvironment
+
+    var accessibilityGrantDiagnosis: AccessibilityGrantDiagnosis {
+        AccessibilityGrantDiagnosis.diagnose(
+            accessibilityTrusted: permissionManager.isTrusted,
+            inputMonitoringGranted: permissionManager.isInputMonitoringEnabled,
+            currentSigningFingerprint: signingIdentity.fingerprint,
+            lastGrantedSigningFingerprint: grantHistory.lastGrantedSigningFingerprint,
+            hasRequestedAccessibilityBefore: grantHistory.hasRequestedAccessibilityBefore
+        )
+    }
+
+    let signingIdentity: CodeSigningIdentity
+
     private let permissionManager: AccessibilityPermissionManager
     private let reader: AccessibilityReader
     private let formReader: FormReader
     private let formPlanner: FormFillPlanning
     private let replacer: TextReplacer
-    private let systemSettingsURLOpener: (URL) -> Bool
+    private var defaults: UserDefaults { environment.defaults }
     private var rewriter: TextRewriting
     private var lastReplacement: LastReplacement?
     private var pendingFormFill: PendingFormFill?
     private var permissionMonitorTask: Task<Void, Never>?
     private var didRequestInputMonitoringDuringCurrentOnboarding = false
+    private let grantHistory: AccessibilityGrantHistory
+    private let permissionPollSchedule: PermissionPollSchedule
+    private var didRecordAccessibilityGrantThisLaunch = false
     private var operationTask: Task<Void, Never>?
     private var statusResetTask: Task<Void, Never>?
 
@@ -82,37 +100,51 @@ final class AppController: ObservableObject {
         formReader: FormReader = FormReader(),
         formPlanner: FormFillPlanning = FormFillPlanner(),
         replacer: TextReplacer = TextReplacer(),
-        systemSettingsURLOpener: @escaping (URL) -> Bool = { NSWorkspace.shared.open($0) }
+        environment: AppEnvironment = .current,
+        // Optional with nil defaults: Swift 6.0 crashes in SILGen when these carry
+        // non-nil defaults next to the main-actor-isolated `environment` default.
+        grantHistory: AccessibilityGrantHistory? = nil,
+        signingIdentity: CodeSigningIdentity? = nil,
+        permissionPollSchedule: PermissionPollSchedule? = nil
     ) {
         self.permissionManager = permissionManager
         self.reader = reader
         self.formReader = formReader
         self.formPlanner = formPlanner
         self.replacer = replacer
-        self.systemSettingsURLOpener = systemSettingsURLOpener
-        self.config = VertexAIConfig.load()
+        self.environment = environment
+        // Grant history lives in the environment's settings so tests never touch real ones.
+        self.grantHistory = grantHistory ?? AccessibilityGrantHistory(defaults: environment.defaults)
+        self.signingIdentity = signingIdentity ?? .current()
+        self.permissionPollSchedule = permissionPollSchedule ?? .standard
+        let defaults = environment.defaults
+        let secretStore = environment.secretStore
+        self.config = VertexAIConfig.load(defaults: defaults, secretStore: secretStore)
         self.mode = .balanced
-        self.rewriteLanguage = RewriteLanguage.load()
+        self.rewriteLanguage = RewriteLanguage.load(defaults: defaults)
         self.lastStatus = "Ready"
-        self.screenTextContextEnabled = UserDefaults.standard.object(
+        self.screenTextContextEnabled = defaults.object(
             forKey: PrivacyDefaultsKey.screenTextContextEnabled
         ) as? Bool ?? true
-        self.diagnosticTextPreviewLoggingEnabled = UserDefaults.standard.bool(
+        self.diagnosticTextPreviewLoggingEnabled = defaults.bool(
             forKey: AppLog.textPreviewLoggingKey
         )
-        self.userProfile = UserProfile.load()
-        self.userProfileEnabled = UserDefaults.standard.object(
+        self.userProfile = UserProfile.load(defaults: defaults)
+        self.userProfileEnabled = defaults.object(
             forKey: UserProfile.DefaultsKey.isEnabled
         ) as? Bool ?? true
-        self.shortcuts = AppShortcuts.load()
-        self.hasClaudeAPIKey = ClaudeAPIKeyStore.hasKey()
-        self.clipboardHistory = ClipboardHistoryStore()
-        self.rewriter = RewriteRouter(configProvider: { VertexAIConfig.load() })
+        self.shortcuts = AppShortcuts.load(defaults: defaults)
+        self.hasClaudeAPIKey = ClaudeAPIKeyStore.hasKey(secretStore: secretStore)
+        self.clipboardHistory = ClipboardHistoryStore(pasteboard: environment.pasteboard, defaults: defaults)
+        self.rewriter = RewriteRouter(configProvider: {
+            VertexAIConfig.load(defaults: defaults, secretStore: secretStore)
+        })
         self.voiceInput = VoiceInputController(
             reader: reader,
             replacer: replacer,
             permissionManager: permissionManager,
-            voicePill: VoicePillController()
+            voicePill: VoicePillController(),
+            environment: environment
         )
         voiceInput.onHUDMessage = { [weak self] message in
             self?.showHUD(message)
@@ -202,10 +234,16 @@ final class AppController: ObservableObject {
 
     func focusedInputTargetForUI() -> FocusedInputTarget? {
         guard permissionManager.isTrusted else {
+            AppLog.write("focused input unavailable for quick menu: accessibility not trusted")
             return nil
         }
 
-        return try? reader.captureFocusedInputTarget()
+        do {
+            return try reader.captureFocusedInputTarget()
+        } catch {
+            AppLog.write("focused input unavailable for quick menu: \(error.localizedDescription)")
+            return nil
+        }
     }
 
     func startClipboardHistoryMonitoring() {
@@ -226,8 +264,8 @@ final class AppController: ObservableObject {
         operationTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.operationTask = nil }
+            // The store logs the specific reason.
             guard await self.clipboardHistory.pasteItem(id: id, target: target) else {
-                AppLog.write("clipboard history paste skipped: item or target unavailable, or operation cancelled")
                 self.showHUD(HUDMessage(title: "貼り付けを中止しました", detail: "入力欄を確認して再実行", tone: .warning, duration: 2.5))
                 return
             }
@@ -380,7 +418,7 @@ final class AppController: ObservableObject {
 
     func setRewriteLanguage(_ language: RewriteLanguage) {
         self.rewriteLanguage = language
-        language.save()
+        language.save(defaults: defaults)
         setStatus(language.displayName)
         showHUD(HUDMessage(
             title: "返信言語",
@@ -391,12 +429,12 @@ final class AppController: ObservableObject {
     }
 
     func saveConfig() {
-        do { try config.save() }
+        do { try config.save(to: defaults, secretStore: environment.secretStore) }
         catch { presentError(error); return }
         if !claudeAPIKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             guard saveClaudeAPIKey() else { return }
         }
-        rewriteLanguage.save()
+        rewriteLanguage.save(defaults: defaults)
         savePrivacySettings()
         saveUserProfile()
         saveShortcuts(showHUD: false)
@@ -415,14 +453,14 @@ final class AppController: ObservableObject {
         let key = claudeAPIKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else { return false }
         do {
-            try ClaudeAPIKeyStore.save(key)
+            try ClaudeAPIKeyStore.save(key, secretStore: environment.secretStore)
         } catch {
             AppLog.write("claude key save failed: \(error.localizedDescription)")
             presentError(error)
             return false
         }
         claudeAPIKeyInput = ""
-        hasClaudeAPIKey = ClaudeAPIKeyStore.hasKey()
+        hasClaudeAPIKey = ClaudeAPIKeyStore.hasKey(secretStore: environment.secretStore)
         claudeConnectionTestResult = nil
         AppLog.write("claude key saved")
         setStatus("Saved")
@@ -431,14 +469,14 @@ final class AppController: ObservableObject {
 
     func deleteClaudeAPIKey() {
         do {
-            try ClaudeAPIKeyStore.delete()
+            try ClaudeAPIKeyStore.delete(secretStore: environment.secretStore)
         } catch {
             AppLog.write("claude key delete failed: \(error.localizedDescription)")
             presentError(error)
             return
         }
         claudeAPIKeyInput = ""
-        hasClaudeAPIKey = ClaudeAPIKeyStore.hasKey()
+        hasClaudeAPIKey = ClaudeAPIKeyStore.hasKey(secretStore: environment.secretStore)
         claudeConnectionTestResult = nil
         AppLog.write("claude key deleted")
         setStatus("Cleared")
@@ -452,8 +490,9 @@ final class AppController: ObservableObject {
         }
         claudeConnectionTestResult = "確認中..."
         // An unsaved key in the field is tested as typed; otherwise the saved Keychain key is used.
+        let secretStore = environment.secretStore
         let client = ClaudeAPIClient(apiKeyProvider: {
-            pendingKey.isEmpty ? ClaudeAPIKeyStore.load() : pendingKey
+            pendingKey.isEmpty ? ClaudeAPIKeyStore.load(secretStore: secretStore) : pendingKey
         })
         Task { @MainActor [weak self] in
             do {
@@ -474,7 +513,7 @@ final class AppController: ObservableObject {
         if sanitized != shortcuts {
             shortcuts = sanitized
         }
-        sanitized.save()
+        sanitized.save(defaults: defaults)
         let failure = onShortcutsChange?(sanitized)
         AppLog.write("shortcuts saved rewrite=\(sanitized.rewrite.displayName) restore=\(sanitized.restore.displayName) form=\(sanitized.formFill.displayName) menu=\(sanitized.quickMenu.displayName) voice=\(sanitized.voiceTrigger.displayName)")
         if showHUD, failure == nil {
@@ -585,8 +624,8 @@ final class AppController: ObservableObject {
     }
 
     func saveUserProfile() {
-        userProfile.save()
-        UserDefaults.standard.set(userProfileEnabled, forKey: UserProfile.DefaultsKey.isEnabled)
+        userProfile.save(defaults: defaults)
+        defaults.set(userProfileEnabled, forKey: UserProfile.DefaultsKey.isEnabled)
     }
 
     func exportUserProfile() {
@@ -649,6 +688,52 @@ final class AppController: ObservableObject {
         }
     }
 
+    /// Zips the log, MetricKit diagnostics, and versions onto the Desktop for a bug report.
+    func exportDiagnostics() {
+        AppLog.write("diagnostics export requested")
+        AppLog.flushSync()
+        let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Desktop")
+        let exporter = DiagnosticsExporter(
+            logDirectory: AppLog.logDirectory,
+            destinationDirectory: desktop,
+            systemSummary: diagnosticsSummary()
+        )
+        do {
+            let url = try exporter.export()
+            AppLog.write("diagnostics exported file=\(url.lastPathComponent)")
+            setStatus("Exported")
+            showHUD(HUDMessage(
+                title: "診断情報を書き出しました",
+                detail: "デスクトップ / \(url.lastPathComponent)",
+                tone: .success,
+                duration: 3.0
+            ))
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } catch {
+            AppLog.write("diagnostics export failed: \(error.localizedDescription)")
+            presentError(error)
+        }
+    }
+
+    /// Versions, permission states, and settings switches only. No text the user typed or copied.
+    func diagnosticsSummary(now: Date = Date()) -> String {
+        let lines = [
+            "ResponseAi \(AppVersionInfo.version) (\(AppVersionInfo.build))",
+            "macOS \(AppVersionInfo.operatingSystem) / \(ProcessInfo.processInfo.operatingSystemVersionString)",
+            "Model: \(AppVersionInfo.hardwareModel)",
+            "Exported: \(ISO8601DateFormatter().string(from: now))",
+            "Accessibility: \(permissionManager.isTrusted ? "OK" : "未許可")",
+            "Input Monitoring: \(permissionManager.isInputMonitoringEnabled ? "OK" : "未許可")",
+            "Screen Recording: \(ScreenTextReader.hasScreenCaptureAccess() ? "OK" : "未許可")",
+            "AI route: \(activeAIRoute.displayName)",
+            "Clipboard history: \(clipboardHistory.isEnabled ? "on" : "off") items=\(clipboardHistory.items.count) monitoring=\(clipboardHistory.isMonitoring)",
+            "Text preview logging: \(diagnosticTextPreviewLoggingEnabled ? "on" : "off")",
+            "Voice engine: \(SpeechDictationEngineFactory.engineName) locale=\(voiceInput.settings.localeIdentifier) mode=\(voiceInput.settings.activationMode.rawValue)"
+        ] + voiceInput.readinessLines(voiceShortcut: shortcuts.voiceTrigger.displayName)
+        return lines.joined(separator: "\n") + "\n"
+    }
+
     func clearUserProfile() {
         userProfile = UserProfile()
         saveUserProfile()
@@ -665,11 +750,11 @@ final class AppController: ObservableObject {
     }
 
     func savePrivacySettings() {
-        UserDefaults.standard.set(
+        defaults.set(
             screenTextContextEnabled,
             forKey: PrivacyDefaultsKey.screenTextContextEnabled
         )
-        UserDefaults.standard.set(
+        defaults.set(
             diagnosticTextPreviewLoggingEnabled,
             forKey: AppLog.textPreviewLoggingKey
         )
@@ -678,13 +763,32 @@ final class AppController: ObservableObject {
     /// Observe TCC state without invoking either system permission request API.
     /// Only an explicit user action may call `requestHotKeyPermissionsFromUserAction`.
     func observeHotKeyPermissionsIfNeeded() {
+        recordAccessibilityGrantIfTrusted()
         guard !hotKeyPermissionsAreGranted else {
             AppLog.write("keyboard permissions granted")
             return
         }
-        AppLog.write("keyboard permission observation started state=\(permissionManager.hotKeyPermissionState)")
+        AppLog.write("keyboard permission observation started state=\(permissionManager.hotKeyPermissionState) diagnosis=\(accessibilityGrantDiagnosis.logLabel)")
         startPermissionMonitor(continueUserInitiatedOnboarding: false)
     }
+
+    /// Logs when the signing identity differs from the previous launch, because
+    /// macOS then stops applying grants made for the old identity.
+    func logSigningIdentityChangeSinceLastLaunch() {
+        guard let previous = grantHistory.recordLaunch(signingFingerprint: signingIdentity.fingerprint) else {
+            return
+        }
+        AppLog.write("signing identity changed since last launch previous=\"\(previous)\" current=\"\(signingIdentity.fingerprint)\" existing Accessibility/Input Monitoring grants may no longer apply")
+    }
+
+    private func recordAccessibilityGrantIfTrusted() {
+        guard !didRecordAccessibilityGrantThisLaunch, permissionManager.isTrusted else {
+            return
+        }
+        didRecordAccessibilityGrantThisLaunch = true
+        grantHistory.recordGranted(signingFingerprint: signingIdentity.fingerprint, version: "\(AppVersionInfo.version) (\(AppVersionInfo.build))")
+    }
+
 
     func requestHotKeyPermissionsFromUserAction(showAlert: Bool = true) {
         let state = permissionManager.hotKeyPermissionState
@@ -706,7 +810,8 @@ final class AppController: ObservableObject {
         case .granted:
             return
         case .accessibilityRequired, .accessibilityAndInputMonitoringRequired:
-            AppLog.write("accessibility permission requested")
+            AppLog.write("accessibility permission requested diagnosis=\(accessibilityGrantDiagnosis.logLabel)")
+            grantHistory.recordAccessibilityRequested()
             _ = permissionManager.requestPermissionPrompt()
             openAccessibilitySettings()
         case .inputMonitoringRequired:
@@ -729,12 +834,34 @@ final class AppController: ObservableObject {
         case .granted:
             "アクセシビリティと入力監視は有効です。"
         case .accessibilityRequired:
-            "システム設定 > プライバシーとセキュリティ > アクセシビリティでResponseAiをオンにしてください。"
+            accessibilityGrantDiagnosis.isStaleGrantLikely
+                ? Self.staleAccessibilityGrantGuidance
+                : "システム設定 > プライバシーとセキュリティ > アクセシビリティでResponseAiをオンにしてください。\n\n" + Self.removeAndReAddFallback
         case .inputMonitoringRequired:
             "システム設定 > プライバシーとセキュリティ > 入力監視でResponseAiをオンにしてください。macOSから求められた場合はResponseAiを再起動してください。"
         case .accessibilityAndInputMonitoringRequired:
-            "まずアクセシビリティでResponseAiをオンにしてください。反映後、入力監視が必要な場合は続けて案内します。"
+            accessibilityGrantDiagnosis.isStaleGrantLikely
+                ? Self.staleAccessibilityGrantGuidance
+                : "まずアクセシビリティでResponseAiをオンにしてください。反映後、入力監視が必要な場合は続けて案内します。\n\n" + Self.removeAndReAddFallback
         }
+    }
+
+    // Toggling an entry that was granted to a different signature never applies, so
+    // the guidance must say to remove the entry rather than only to switch it on.
+    static let staleAccessibilityGrantGuidance = """
+        以前の許可が古いまま残っている可能性が高いです。アクセシビリティの一覧でResponseAiがオンになっていても、macOSはこのResponseAiを許可済みとして扱っていません。
+
+        1. システム設定 > プライバシーとセキュリティ > アクセシビリティを開く
+        2. ResponseAiを選んで「−」で削除する（オン／オフの切り替えでは直りません）
+        3. 「＋」で /Applications/ResponseAi.app を追加してオンにする
+        """
+
+    static let removeAndReAddFallback = "すでにオンなのに使えない場合は、一覧のResponseAiを「−」で削除し、「＋」で追加し直してください。"
+
+    private var accessibilityShortDetail: String {
+        accessibilityGrantDiagnosis.isStaleGrantLikely
+            ? "一覧から−で削除→＋で追加し直す"
+            : "アクセシビリティをオン"
     }
 
     func requestScreenRecordingPermission() {
@@ -783,7 +910,7 @@ final class AppController: ObservableObject {
         case .granted:
             detail = ready ? shortcuts.rewrite.displayName : "メニューからショートカットを修復"
         case .accessibilityRequired, .accessibilityAndInputMonitoringRequired:
-            detail = "アクセシビリティをオン"
+            detail = accessibilityShortDetail
         case .inputMonitoringRequired:
             detail = "入力監視をオン"
         }
@@ -1118,8 +1245,8 @@ final class AppController: ObservableObject {
         let accessibilityOK = permissionManager.isTrusted
         let inputMonitoringOK = permissionManager.isInputMonitoringEnabled
         let screenRecordingOK = ScreenTextReader.hasScreenCaptureAccess()
-        let loadedConfig = VertexAIConfig.load()
-        hasClaudeAPIKey = ClaudeAPIKeyStore.hasKey()
+        let loadedConfig = VertexAIConfig.load(defaults: defaults, secretStore: environment.secretStore)
+        hasClaudeAPIKey = ClaudeAPIKeyStore.hasKey(secretStore: environment.secretStore)
         let route = AIBackendRoute.select(hasClaudeKey: hasClaudeAPIKey, config: loadedConfig)
         let claudeStatus = await claudeHealthStatus()
         let proxyStatus = await proxyHealthStatus(for: loadedConfig)
@@ -1141,7 +1268,11 @@ final class AppController: ObservableObject {
             ? "隠れています メニューバーアイコン（ノッチ）"
             : "OK メニューバーアイコン"
         let lines = [
-            "\(accessibilityOK ? "OK" : "未許可") アクセシビリティ",
+            accessibilityOK
+                ? "OK アクセシビリティ"
+                : (accessibilityGrantDiagnosis.isStaleGrantLikely
+                    ? "未許可 アクセシビリティ（古い許可が残っている可能性。一覧から−で削除→＋で追加）"
+                    : "未許可 アクセシビリティ"),
             "\(inputMonitoringOK ? "OK" : "未許可") 入力監視",
             "\(screenRecordingOK ? "OK" : "未許可") 画面収録",
             "AI経路: \(route.displayName)",
@@ -1270,9 +1401,12 @@ final class AppController: ObservableObject {
                 return
             }
 
-            for attempt in 1...120 {
-                guard !Task.isCancelled else { return }
+            let schedule = self.permissionPollSchedule
+            var attempt = 0
+            while !Task.isCancelled {
+                attempt += 1
                 let state = self.permissionManager.hotKeyPermissionState
+                self.recordAccessibilityGrantIfTrusted()
                 if state == .granted {
                     let shortcutsReady = self.onHotKeyPermissionsGranted?() ?? false
                     AppLog.write("keyboard permissions granted after monitor attempt=\(attempt)")
@@ -1293,24 +1427,26 @@ final class AppController: ObservableObject {
                     self.requestInputMonitoringPermission()
                 }
 
-                if attempt == 1 || attempt % 10 == 0 {
+                if schedule.shouldLog(attempt: attempt) {
                     AppLog.write("keyboard permissions pending state=\(state) attempt=\(attempt)")
                 }
 
-                do { try await Task.sleep(for: .seconds(1)) } catch { return }
-            }
+                // Keep checking at a slower pace instead of giving up: a grant made
+                // after the fast phase must still register without a relaunch.
+                if schedule.isFastPhaseEnd(attempt) {
+                    AppLog.write("keyboard permission monitor slowed state=\(state) diagnosis=\(self.accessibilityGrantDiagnosis.logLabel)")
+                    if continueUserInitiatedOnboarding {
+                        self.showHUD(HUDMessage(
+                            title: "権限がまだ未反映です",
+                            detail: self.hotKeyPermissionTimeoutDetail(for: state),
+                            tone: .warning,
+                            duration: 5.0
+                        ))
+                    }
+                }
 
-            let state = self.permissionManager.hotKeyPermissionState
-            AppLog.write("keyboard permission monitor timed out state=\(state)")
-            if continueUserInitiatedOnboarding {
-                self.showHUD(HUDMessage(
-                    title: "権限がまだ未反映です",
-                    detail: self.hotKeyPermissionTimeoutDetail(for: state),
-                    tone: .warning,
-                    duration: 5.0
-                ))
+                do { try await Task.sleep(for: schedule.interval(afterAttempt: attempt)) } catch { return }
             }
-            self.permissionMonitorTask = nil
         }
     }
 
@@ -1319,7 +1455,9 @@ final class AppController: ObservableObject {
         case .granted:
             "「ショートカットを修復」を実行"
         case .accessibilityRequired, .accessibilityAndInputMonitoringRequired:
-            "アクセシビリティをオンにしてください"
+            accessibilityGrantDiagnosis.isStaleGrantLikely
+                ? "一覧からResponseAiを−で削除し、＋で追加し直してください"
+                : "アクセシビリティをオンにしてください"
         case .inputMonitoringRequired:
             "入力監視をオン（反映しない場合は再起動）"
         }
@@ -1335,7 +1473,7 @@ final class AppController: ObservableObject {
             guard let url = URL(string: urlString) else {
                 continue
             }
-            if systemSettingsURLOpener(url) {
+            if environment.openURL(url) {
                 AppLog.write("opened accessibility settings: \(urlString)")
                 return
             }
@@ -1352,7 +1490,7 @@ final class AppController: ObservableObject {
             guard let url = URL(string: urlString) else {
                 continue
             }
-            if systemSettingsURLOpener(url) {
+            if environment.openURL(url) {
                 AppLog.write("opened input monitoring settings: \(urlString)")
                 return
             }
@@ -1369,7 +1507,7 @@ final class AppController: ObservableObject {
             guard let url = URL(string: urlString) else {
                 continue
             }
-            if systemSettingsURLOpener(url) {
+            if environment.openURL(url) {
                 AppLog.write("opened screen recording settings: \(urlString)")
                 return
             }

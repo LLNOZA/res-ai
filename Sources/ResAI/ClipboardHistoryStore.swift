@@ -33,11 +33,22 @@ struct ClipboardHistoryItem: Codable, Equatable, Identifiable, Sendable {
 
 @MainActor
 final class ClipboardHistoryStore: ObservableObject {
+    enum ClearReason: String {
+        /// "履歴を消去" in the quick menu or settings.
+        case user
+        /// The history setting was turned off.
+        case disabled
+    }
+
     @Published var isEnabled: Bool {
         didSet {
+            guard isEnabled != oldValue else { return }
             defaults.set(isEnabled, forKey: DefaultsKey.isEnabled)
             if isEnabled {
+                lastChangeCount = pasteboard.changeCount
                 captureCurrentPasteboardText()
+            } else {
+                clear(reason: .disabled)
             }
         }
     }
@@ -46,6 +57,7 @@ final class ClipboardHistoryStore: ObservableObject {
     private let pasteboard: NSPasteboard
     private let defaults: UserDefaults
     private var timer: Timer?
+    private var wakeObserver: NSObjectProtocol?
     private var lastChangeCount: Int
     private var persistTask: Task<Void, Never>?
     private var lastCaptureLogAt: Date?
@@ -53,10 +65,9 @@ final class ClipboardHistoryStore: ObservableObject {
 
     private static let maxItems = 50
 
-    init(
-        pasteboard: NSPasteboard = .general,
-        defaults: UserDefaults = .standard
-    ) {
+    /// No defaults on purpose: the app passes `AppEnvironment`'s pasteboard and settings,
+    /// tests pass their own, and nothing reaches `NSPasteboard.general` by accident.
+    init(pasteboard: NSPasteboard, defaults: UserDefaults) {
         self.pasteboard = pasteboard
         self.defaults = defaults
         self.isEnabled = defaults.object(forKey: DefaultsKey.isEnabled) as? Bool ?? true
@@ -65,6 +76,9 @@ final class ClipboardHistoryStore: ObservableObject {
         self.lastLoggedCount = self.items.count
     }
 
+    var isMonitoring: Bool { timer != nil }
+
+    /// Idempotent: a second call keeps the single running timer and observer.
     func startMonitoring() {
         guard timer == nil else {
             return
@@ -77,29 +91,52 @@ final class ClipboardHistoryStore: ObservableObject {
                 self?.pollPasteboard()
             }
         }
+        timer.tolerance = 0.2
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
+
+        // Timers do not fire during sleep; pick up anything copied right before it at once.
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.pollPasteboard()
+            }
+        }
     }
 
+    /// Stops polling and saves. Never removes items.
     func stopMonitoring() {
         timer?.invalidate()
         timer = nil
+        if let wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
+            self.wakeObserver = nil
+        }
         persistImmediately()
     }
 
-    func clear() {
+    /// The only way items are removed in bulk: an explicit user action or turning history off.
+    func clear(reason: ClearReason = .user) {
+        let removed = items.count
         items.removeAll()
         persistImmediately()
-        AppLog.write("clipboard history cleared")
+        AppLog.write("clipboard history cleared reason=\(reason.rawValue) removed=\(removed)")
     }
 
     @discardableResult
     func pasteItem(id: UUID, target: FocusedInputTarget?) async -> Bool {
         guard let item = items.first(where: { $0.id == id }) else {
+            AppLog.write("clipboard history paste failed reason=item-missing")
             return false
         }
 
-        guard let target else { return false }
+        guard let target else {
+            AppLog.write("clipboard history paste failed reason=no-focused-input")
+            return false
+        }
         guard await pasteIntoTarget(item.text, target: target) else { return false }
         add(text: item.text, copiedAt: item.copiedAt)
 
@@ -189,10 +226,14 @@ final class ClipboardHistoryStore: ObservableObject {
     }
 
     private static func loadItems(defaults: UserDefaults) -> [ClipboardHistoryItem] {
-        guard
-            let data = defaults.data(forKey: DefaultsKey.items),
-            let decoded = try? JSONDecoder().decode([ClipboardHistoryItem].self, from: data)
-        else {
+        guard let data = defaults.data(forKey: DefaultsKey.items) else {
+            return []
+        }
+        guard let decoded = try? JSONDecoder().decode([ClipboardHistoryItem].self, from: data) else {
+            // The next save would overwrite the unreadable copy with an empty list.
+            // Keep it aside so the loss is visible and recoverable.
+            defaults.set(data, forKey: DefaultsKey.unreadableItems)
+            AppLog.write("clipboard history unreadable bytes=\(data.count); kept as backup")
             return []
         }
 
@@ -217,8 +258,15 @@ final class ClipboardHistoryStore: ObservableObject {
                 let appElement = AXUIElementCreateApplication(pid)
                 AXUIElementSetMessagingTimeout(appElement, 0.15)
                 AXUIElementPerformAction(appElement, kAXRaiseAction as CFString)
-                await MainActor.run {
-                    _ = NSRunningApplication(processIdentifier: pid)?.activate(options: [.activateAllWindows])
+                let activation = await MainActor.run { () -> Bool? in
+                    NSRunningApplication(processIdentifier: pid)?.activate(options: [.activateAllWindows])
+                }
+                guard let activated = activation else {
+                    throw ClipboardPasteFailure(reason: "target-app-gone")
+                }
+                if !activated {
+                    // macOS 14+ cooperative activation may refuse; the focus check below decides.
+                    await MainActor.run { AppLog.write("clipboard history paste: target activation refused") }
                 }
                 AXUIElementSetAttributeValue(
                     elementBox.value,
@@ -229,7 +277,7 @@ final class ClipboardHistoryStore: ObservableObject {
             await InputSynthesizer.shared.sleep(milliseconds: 60)
 
             clipboardRestoreSelectedTextRange(range, in: elementBox.value)
-            AXUIElementSetAttributeValue(
+            let focusResult = AXUIElementSetAttributeValue(
                 elementBox.value,
                 kAXFocusedAttribute as CFString,
                 kCFBooleanTrue
@@ -238,9 +286,12 @@ final class ClipboardHistoryStore: ObservableObject {
             await InputSynthesizer.shared.sleep(milliseconds: 35)
             try Task.checkCancellation()
             var focused: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(AXUIElementCreateSystemWide(), kAXFocusedUIElementAttribute as CFString, &focused) == .success,
-                  let focused, CFEqual(focused, elementBox.value) else {
-                throw CancellationError()
+            let readResult = AXUIElementCopyAttributeValue(AXUIElementCreateSystemWide(), kAXFocusedUIElementAttribute as CFString, &focused)
+            guard readResult == .success, let focused else {
+                throw ClipboardPasteFailure(reason: "focus-unreadable axError=\(readResult.rawValue)")
+            }
+            guard CFEqual(focused, elementBox.value) else {
+                throw ClipboardPasteFailure(reason: "focus-moved setFocusAXError=\(focusResult.rawValue)")
             }
             // Keep clipboard publication in the same serialized operation as Cmd+V.
             guard let self else { throw CancellationError() }
@@ -275,8 +326,11 @@ final class ClipboardHistoryStore: ObservableObject {
             }
           }
           return true
+        } catch let failure as ClipboardPasteFailure {
+            AppLog.write("clipboard history paste failed reason=\(failure.reason) app=\(target.appInfo.name)")
+            return false
         } catch {
-            AppLog.write("clipboard history paste cancelled or target unavailable")
+            AppLog.write("clipboard history paste failed reason=cancelled app=\(target.appInfo.name)")
             return false
         }
     }
@@ -284,7 +338,13 @@ final class ClipboardHistoryStore: ObservableObject {
     private enum DefaultsKey {
         static let isEnabled = "clipboardHistory.isEnabled"
         static let items = "clipboardHistory.items.v1"
+        static let unreadableItems = "clipboardHistory.items.v1.unreadable"
     }
+}
+
+/// Why a quick-menu paste was abandoned. The reason goes to the log; the text never does.
+private struct ClipboardPasteFailure: Error {
+    let reason: String
 }
 
 private func clipboardRestoreSelectedTextRange(_ range: CFRange?, in element: AXUIElement) {

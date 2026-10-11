@@ -6,9 +6,11 @@ import XCTest
 @MainActor
 final class ShortcutWarningConfirmationTests: XCTestCase {
     private var asked: [(ShortcutAction, ShortcutTrigger, ShortcutWarning)] = []
+    private var environment: AppEnvironment?
 
     private func makeController(answer: Bool) -> AppController {
-        UserDefaults.standard.removeObject(forKey: AppShortcuts.DefaultsKey.shortcuts)
+        let environment = AppEnvironment.isolated()
+        self.environment = environment
         let controller = AppController(
             permissionManager: AccessibilityPermissionManager(
                 accessibilityTrustCheck: { false },
@@ -16,7 +18,7 @@ final class ShortcutWarningConfirmationTests: XCTestCase {
                 inputMonitoringAccessCheck: { false },
                 inputMonitoringAccessRequest: { false }
             ),
-            systemSettingsURLOpener: { _ in true }
+            environment: environment
         )
         controller.confirmShortcutWarning = { [weak self] action, trigger, warning in
             self?.asked.append((action, trigger, warning))
@@ -27,7 +29,7 @@ final class ShortcutWarningConfirmationTests: XCTestCase {
 
     private func finish(_ controller: AppController) {
         controller.shutDown()
-        UserDefaults.standard.removeObject(forKey: AppShortcuts.DefaultsKey.shortcuts)
+        environment?.discard()
     }
 
     private let bareJ = ShortcutTrigger.key(HotKeyShortcut(keyCode: UInt32(kVK_ANSI_J), modifiers: []))

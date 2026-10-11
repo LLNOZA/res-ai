@@ -25,7 +25,17 @@ final class VoiceHotKeyCancelTests: XCTestCase {
         func cancel() { isRunning = false }
     }
 
+    private var environments: [AppEnvironment] = []
+
+    override func tearDown() async throws {
+        environments.forEach { $0.discard() }
+        environments.removeAll()
+        try await super.tearDown()
+    }
+
     private func makeController(engine: FakeEngine) -> VoiceInputController {
+        let environment = AppEnvironment.isolated()
+        environments.append(environment)
         let controller = VoiceInputController(
             reader: AccessibilityReader(),
             replacer: TextReplacer(),
@@ -36,7 +46,8 @@ final class VoiceHotKeyCancelTests: XCTestCase {
                 inputMonitoringAccessRequest: { false }
             ),
             engine: engine,
-            claudeAPIKeyProvider: { nil }
+            claudeAPIKeyProvider: { nil },
+            environment: environment
         )
         controller.settings.activationMode = .holdOrTap
         return controller
