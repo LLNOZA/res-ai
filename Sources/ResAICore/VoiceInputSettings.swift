@@ -166,8 +166,8 @@ public struct VoiceInputSettings: Equatable, Sendable {
 public enum GeminiAPIKeyStore {
     private static let account = "gemini.apiKey"
 
-    public static func load() -> String? {
-        let value = (try? KeychainStore().string(for: account))?
+    public static func load(secretStore: any SecretStringStoring = KeychainStore()) -> String? {
+        let value = (try? secretStore.string(for: account))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard let value, !value.isEmpty else {
             return nil
@@ -175,7 +175,7 @@ public enum GeminiAPIKeyStore {
         return value
     }
 
-    public static func save(_ key: String) throws {
-        try KeychainStore().setString(key, for: account)
+    public static func save(_ key: String, secretStore: any SecretStringStoring = KeychainStore()) throws {
+        try secretStore.setString(key, for: account)
     }
 }

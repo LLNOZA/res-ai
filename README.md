@@ -80,6 +80,10 @@ For development, the Swift Package executable still works:
 swift run ResponseAi
 ```
 
+To try the macOS 14/15 voice path (`SFSpeechRecognizer`) on macOS 26, launch with `RESAI_FORCE_LEGACY_SPEECH=1`.
+
+`swift test` never touches the real environment: inside an XCTest process the log goes to a per-process temporary directory instead of `~/Library/Logs/ResponseAi/`, and `AppController` / `VoiceInputController` default to an isolated `AppEnvironment` (private UserDefaults suite, in-memory Keychain, uniquely named pasteboard, a System Settings opener that opens nothing). Tests that need these pass `AppEnvironment.isolated()` and call `discard()` afterwards.
+
 ## Build Installer
 
 App updates are not complete until both the current-version PKG and DMG are built and verified against the final app build. Verify the delivered files' sizes and SHA-256 hashes against the local originals, then copy them to your private release destination according to your deployment process. `dist/installer/` is local build output only. Preserve existing installers before running `build_pkg.sh`, which currently removes the local installer output directory.
@@ -111,8 +115,8 @@ Build both release artifacts:
 The generated installers are written to:
 
 ```text
-dist/installer/ResponseAi-0.4.1.pkg
-dist/installer/ResponseAi-0.4.1.dmg
+dist/installer/ResponseAi-0.4.2.pkg
+dist/installer/ResponseAi-0.4.2.dmg
 ```
 
 If a `Developer ID Application` certificate is installed, `scripts/build_app.sh` uses it for the app bundle and `scripts/build_dmg.sh` signs the DMG. If a `Developer ID Installer` certificate is installed, `scripts/build_pkg.sh` signs the installer package. Without those certificates, the scripts still build unsigned local-testing installers.
@@ -140,8 +144,8 @@ RESAI_NOTARIZE=1 \
 You can also notarize one artifact directly:
 
 ```bash
-./scripts/notarize_pkg.sh dist/installer/ResponseAi-0.4.1.pkg
-./scripts/notarize_dmg.sh dist/installer/ResponseAi-0.4.1.dmg
+./scripts/notarize_pkg.sh dist/installer/ResponseAi-0.4.2.pkg
+./scripts/notarize_dmg.sh dist/installer/ResponseAi-0.4.2.dmg
 ```
 
 On first app run, use `ResponseAi > アクセシビリティ／入力監視を開く` (or the `操作権限` button in Settings), then grant Accessibility and Input Monitoring permission to `ResponseAi`:
@@ -215,6 +219,10 @@ ResponseAi > Run Readiness Check
 ```
 
 The check shows whether Accessibility and Input Monitoring are active, whether Screen Recording is available for browser context OCR, which AI route is active, whether the Claude API key is accepted (`GET /v1/models`, no tokens used), whether the Cloud Run proxy health endpoint responds (informational only while a Claude API key is set), whether the local writing profile is enabled, whether voice input is ready, and which hotkeys are active.
+
+### 診断情報
+
+`設定 > プライバシー > 診断情報を書き出す` zips the app log, MetricKit crash/hang reports, and a summary (app/OS versions, Mac model, permission states, voice engine) onto the Desktop. MetricKit reports are saved at the next launch to `~/Library/Logs/ResponseAi/diagnostics/` as JSON with Objective-C exception messages removed. Each launch logs whether the previous run ended normally (`previous session: ...`). Typed or copied text is not included unless the debug text-preview logging toggle is on.
 
 ## AI backend config
 

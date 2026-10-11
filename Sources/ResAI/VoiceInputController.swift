@@ -42,6 +42,7 @@ final class VoiceInputController: ObservableObject {
     private let reader: AccessibilityReader
     private let replacer: TextReplacer
     private let permissionManager: AccessibilityPermissionManager
+    private let environment: AppEnvironment
     private let proxyConfigProvider: () -> VertexAIConfig
     private let claudeAPIKeyProvider: () -> String?
     private var phase: Phase = .idle
@@ -82,19 +83,25 @@ final class VoiceInputController: ObservableObject {
         permissionManager: AccessibilityPermissionManager,
         voicePill: VoicePillController = VoicePillController(),
         engine: (any SpeechDictating)? = nil,
-        proxyConfigProvider: @escaping () -> VertexAIConfig = { VertexAIConfig.load() },
-        claudeAPIKeyProvider: @escaping () -> String? = { ClaudeAPIKeyStore.load() }
+        proxyConfigProvider: (() -> VertexAIConfig)? = nil,
+        claudeAPIKeyProvider: (() -> String?)? = nil,
+        environment: AppEnvironment = .current
     ) {
+        let defaults = environment.defaults
+        let secretStore = environment.secretStore
         self.reader = reader
         self.replacer = replacer
         self.permissionManager = permissionManager
-        self.proxyConfigProvider = proxyConfigProvider
-        self.claudeAPIKeyProvider = claudeAPIKeyProvider
+        self.environment = environment
+        self.proxyConfigProvider = proxyConfigProvider ?? {
+            VertexAIConfig.load(defaults: defaults, secretStore: secretStore)
+        }
+        self.claudeAPIKeyProvider = claudeAPIKeyProvider ?? { ClaudeAPIKeyStore.load(secretStore: secretStore) }
         self.voicePill = voicePill
         self.engine = engine ?? SpeechDictationEngineFactory.make()
-        self.settings = VoiceInputSettings.load()
-        self.dictionary = UserDictionary.load()
-        self.geminiAPIKey = GeminiAPIKeyStore.load() ?? ""
+        self.settings = VoiceInputSettings.load(defaults: defaults)
+        self.dictionary = UserDictionary.load(defaults: defaults)
+        self.geminiAPIKey = GeminiAPIKeyStore.load(secretStore: secretStore) ?? ""
     }
 
     var isSupported: Bool {
@@ -777,10 +784,13 @@ final class VoiceInputController: ObservableObject {
     // MARK: - Settings
 
     func saveSettings() {
-        settings.save()
-        dictionary.save()
+        settings.save(defaults: environment.defaults)
+        dictionary.save(defaults: environment.defaults)
         do {
-            try GeminiAPIKeyStore.save(geminiAPIKey.trimmingCharacters(in: .whitespacesAndNewlines))
+            try GeminiAPIKeyStore.save(
+                geminiAPIKey.trimmingCharacters(in: .whitespacesAndNewlines),
+                secretStore: environment.secretStore
+            )
         } catch {
             AppLog.write("gemini key save failed: \(error.localizedDescription)")
         }
@@ -792,12 +802,12 @@ final class VoiceInputController: ObservableObject {
 
     func addVocabulary(_ raw: String) {
         dictionary.addVocabulary(raw)
-        dictionary.save()
+        dictionary.save(defaults: environment.defaults)
     }
 
     func removeDictionaryEntries(ids: Set<UUID>) {
         dictionary.entries.removeAll { ids.contains($0.id) }
-        dictionary.save()
+        dictionary.save(defaults: environment.defaults)
     }
 
     func testCleanupConnection() {
@@ -997,6 +1007,7 @@ final class VoiceInputController: ObservableObject {
 
     private func handleEngineError(_ error: Error, sessionID: VoiceSessionID) {
         guard activeSessionID == sessionID else { return }
+        AppLog.write("voice engine error engine=\(engine.engineName): \(error.localizedDescription)")
         contextCaptureTask?.cancel()
         if case .listening = phase {
             presentVoiceError(error)
@@ -1031,14 +1042,14 @@ final class VoiceInputController: ObservableObject {
             "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Microphone"
         ]
         for urlString in urls {
-            if let url = URL(string: urlString), NSWorkspace.shared.open(url) {
+            if let url = URL(string: urlString), environment.openURL(url) {
                 return
             }
         }
     }
 
     private func copyToClipboard(_ text: String) {
-        let pasteboard = NSPasteboard.general
+        let pasteboard = environment.pasteboard
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
     }

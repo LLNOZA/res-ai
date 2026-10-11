@@ -41,6 +41,15 @@ enum AppLog {
     static var logURL: URL {
         LogFileSink.logURL
     }
+
+    /// `~/Library/Logs/ResponseAi`, or a per-process temporary directory under XCTest.
+    nonisolated static var logDirectory: URL {
+        LogFileSink.logDirectory
+    }
+
+    nonisolated static var rotatedLogURL: URL {
+        LogFileSink.rotatedLogURL
+    }
 }
 
 /// File I/O on a utility serial queue. `buffer` is protected by `lock`.
@@ -52,12 +61,22 @@ private final class LogFileSink: @unchecked Sendable {
     private let queue = DispatchQueue(label: "ai.res.resai.log", qos: .utility)
     private var flushWorkItem: DispatchWorkItem?
 
-    static var logURL: URL {
+    /// A test run writes to its own temporary directory so `swift test` never adds
+    /// lines to the user's real log.
+    static let logDirectory: URL = {
+        if AppRuntime.isRunningUnitTests {
+            return FileManager.default.temporaryDirectory
+                .appendingPathComponent("ResponseAiTests-\(ProcessInfo.processInfo.processIdentifier)")
+                .appendingPathComponent("Logs")
+        }
         let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
         return (library ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library"))
             .appendingPathComponent("Logs")
             .appendingPathComponent("ResponseAi")
-            .appendingPathComponent("responseai.log")
+    }()
+
+    static var logURL: URL {
+        logDirectory.appendingPathComponent("responseai.log")
     }
 
     static var rotatedLogURL: URL {

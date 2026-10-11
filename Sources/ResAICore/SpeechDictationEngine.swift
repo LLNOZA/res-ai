@@ -22,6 +22,15 @@ public enum SpeechDictationError: Error, LocalizedError, Sendable {
     case audioEngineFailed(String)
     case alreadyRunning
     case notRunning
+    /// SFSpeechRecognizer authorization is denied or restricted (macOS 14/15 path).
+    case speechRecognitionDenied
+    /// SFSpeechRecognizer exists for the locale but reports `isAvailable == false`
+    /// (Dictation turned off, no network for server recognition, ...).
+    case recognizerUnavailable(String)
+    /// The input device or its sample rate changed while recording.
+    case audioDeviceChanged
+    /// Recognition kept failing right after restarts.
+    case recognitionFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -39,6 +48,14 @@ public enum SpeechDictationError: Error, LocalizedError, Sendable {
             "Dictation is already running."
         case .notRunning:
             "Dictation is not running."
+        case .speechRecognitionDenied:
+            "音声認識が許可されていません。システム設定 > プライバシーとセキュリティ > 音声認識 で ResponseAi をオンにしてください。"
+        case .recognizerUnavailable(let locale):
+            "音声認識を今は使えません（\(locale)）。システム設定 > キーボード > 音声入力 がオンか、ネットワーク接続を確認してください。"
+        case .audioDeviceChanged:
+            "マイクの入力装置が切り替わったため音声入力を止めました。もう一度話してください。"
+        case .recognitionFailed(let detail):
+            "音声認識が続けて失敗しました: \(detail)"
         }
     }
 }
@@ -71,23 +88,48 @@ public extension SpeechDictating {
     var isReady: Bool { !isRunning }
 }
 
+public enum SpeechEngineKind: String, Sendable {
+    case speechAnalyzer
+    case legacy
+}
+
 @MainActor
 public enum SpeechDictationEngineFactory {
+    /// Set to 1 to run the macOS 14/15 engine on macOS 26 for manual checks.
+    public static let forceLegacyEnvironmentKey = "RESAI_FORCE_LEGACY_SPEECH"
+
     /// SpeechAnalyzer on macOS 26+; SFSpeechRecognizer on earlier supported versions.
-    public static func make() -> any SpeechDictating {
-        if #available(macOS 26.0, *) {
-            SpeechAnalyzerDictationEngine()
-        } else {
-            LegacySpeechRecognizerEngine()
+    public static func make(kind: SpeechEngineKind = preferredKind()) -> any SpeechDictating {
+        switch kind {
+        case .legacy:
+            return LegacySpeechRecognizerEngine()
+        case .speechAnalyzer:
+            if #available(macOS 26.0, *) {
+                return SpeechAnalyzerDictationEngine()
+            }
+            return LegacySpeechRecognizerEngine()
         }
+    }
+
+    public static func preferredKind(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> SpeechEngineKind {
+        if ["1", "true", "yes"].contains(environment[forceLegacyEnvironmentKey]?.lowercased() ?? "") {
+            return .legacy
+        }
+        if #available(macOS 26.0, *) {
+            return .speechAnalyzer
+        }
+        return .legacy
     }
 
     public static var isSupported: Bool { true }
 
     public static var engineName: String {
-        if #available(macOS 26.0, *) {
+        switch preferredKind() {
+        case .speechAnalyzer:
             "SpeechAnalyzer"
-        } else {
+        case .legacy:
             "SFSpeechRecognizer"
         }
     }
@@ -101,7 +143,9 @@ public enum MicrophonePermission {
 
     public static func request() async -> Bool {
         await withCheckedContinuation { continuation in
-            AVAudioApplication.requestRecordPermission { granted in
+            // The completion runs on an arbitrary queue. Without `@Sendable` the closure
+            // inherits MainActor isolation and Swift 6's runtime check traps off-main.
+            AVAudioApplication.requestRecordPermission { @Sendable granted in
                 continuation.resume(returning: granted)
             }
         }
@@ -399,6 +443,9 @@ public final class SpeechAnalyzerDictationEngine: SpeechDictating {
         capture.audioLevelBridge.reset()
         capture.audioLevelBridge.publish = { [weak self] mapped in
             self?.publishSmoothedLevel(mapped, generation: generation)
+        }
+        capture.onInterrupted = { [weak self] error in
+            self?.handleAnalyzerError(error, generation: generation)
         }
 
         try installMicrophoneTap(analyzerFormat: analyzerFormat, continuation: continuation)
