@@ -39,6 +39,25 @@ public final class CloudRunProxyClient: TextRewriting {
     }
 
     public func rewrite(_ request: RewriteRequest) async throws -> RewriteResult {
+        let rawText = try await generateText(
+            systemInstruction: promptBuilder.systemInstruction(),
+            userPrompt: promptBuilder.userPrompt(for: request),
+            timeout: 20
+        )
+        let text = GeneratedReplySanitizer.sanitize(rawText)
+        guard !text.isEmpty else {
+            throw CloudRunProxyError.invalidResponse
+        }
+
+        return RewriteResult(text: text, source: .cloudRunProxy)
+    }
+
+    /// Sends a prompt pair over the `/v1/rewrite` contract and returns the unsanitized text.
+    public func generateText(
+        systemInstruction: String,
+        userPrompt: String,
+        timeout: TimeInterval
+    ) async throws -> String {
         let config = configProvider()
         guard let proxyURL = config.proxyURL else {
             throw CloudRunProxyError.missingProxyURL
@@ -48,13 +67,13 @@ public final class CloudRunProxyClient: TextRewriting {
         }
 
         let payload = CloudRunProxyRewriteRequest(
-            systemInstruction: promptBuilder.systemInstruction(),
-            userPrompt: promptBuilder.userPrompt(for: request)
+            systemInstruction: systemInstruction,
+            userPrompt: userPrompt
         )
 
         var urlRequest = URLRequest(url: proxyURL)
         urlRequest.httpMethod = "POST"
-        urlRequest.timeoutInterval = 20
+        urlRequest.timeoutInterval = timeout
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         let proxyAuthToken = config.proxyAuthToken.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -67,7 +86,7 @@ public final class CloudRunProxyClient: TextRewriting {
         let session = urlSession
 
         let (data, response) = try await NetworkRequestSafety.runWithTimeout(
-            20,
+            timeout,
             timeoutError: CloudRunProxyError.timeout
         ) {
             try await session.data(for: requestForTransport)
@@ -91,12 +110,7 @@ public final class CloudRunProxyClient: TextRewriting {
            finishReason.uppercased() != "STOP" {
             throw CloudRunProxyError.incompleteResponse(finishReason: finishReason)
         }
-        let text = GeneratedReplySanitizer.sanitize(decoded.text)
-        guard !text.isEmpty else {
-            throw CloudRunProxyError.invalidResponse
-        }
-
-        return RewriteResult(text: text, source: .cloudRunProxy)
+        return decoded.text
     }
 }
 

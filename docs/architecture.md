@@ -97,14 +97,17 @@ After replacement, the app tries to read both the original target element and th
 
 ### VoiceInputController
 
-Typeless-style dictation into the focused field. On macOS 26+, Apple SpeechAnalyzer transcribes on-device. On macOS 14/15, `SFSpeechRecognizer` is the fallback (on-device when the locale supports it). Gemini only cleans the resulting text. Gemini never receives audio.
+Typeless-style dictation into the focused field. On macOS 26+, Apple SpeechAnalyzer transcribes on-device. On macOS 14/15, `SFSpeechRecognizer` is the fallback (on-device when the locale supports it). AI only cleans the resulting text; it never receives audio, only text.
+
+Cleanup goes through the same Cloud Run proxy contract as rewriting (`ProxyDictationCleaner` → `CloudRunProxyClient`, `{systemInstruction, userPrompt}`; Claude `claude-haiku-5-5` by default). `DictationCleanupRouter` picks the route: proxy when configured; otherwise Gemini directly with the user's Gemini API key (`GeminiDictationCleaner`, model from Settings); with neither, the raw transcript stays as-is. Timeouts, failures, and rejected output (`DictationCleanupOutputValidator`) also leave the raw transcript in place.
 
 ```text
 hotkey ──> SpeechAnalyzer (macOS 26+) or SFSpeechRecognizer (macOS 14/15)
            ja_JP default, volatile preview in the voice pill
       ──> UserDictionary.apply
       ──> TextReplacer.insertAtCaret            (raw text lands instantly)
-      ──> Gemini gemini-3.8-flash cleanup        (fillers / punctuation / homophones / dictionary)
+      ──> AI cleanup via Cloud Run proxy         (fillers / punctuation / homophones / dictionary)
+          (Gemini API key direct only when no proxy is configured)
       ──> TextReplacer.replaceInsertedText       (swap only the inserted range, skip if field changed)
 ```
 
