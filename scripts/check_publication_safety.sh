@@ -112,8 +112,9 @@ if [[ "$REQUIRE_APPROVAL" -eq 1 ]]; then
     fail "Local Codex snapshot refs remain. Remove them before approving a public push."
   fi
 
+  # noreply@github.com is GitHub's own committer for web-merged pull requests, not a personal address.
   if git log --all --format='%ae%n%ce' \
-    | awk 'NF && $0 !~ /@users\.noreply\.github\.com$/ { bad = 1 } END { exit bad ? 0 : 1 }'; then
+    | awk 'NF && $0 !~ /@users\.noreply\.github\.com$/ && $0 != "noreply@github.com" { bad = 1 } END { exit bad ? 0 : 1 }'; then
     fail "Git history contains a direct author or committer email address."
   fi
 
