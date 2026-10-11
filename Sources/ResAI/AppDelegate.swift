@@ -95,7 +95,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        AppLog.write("app launched")
+        // Version and signer decide whether existing permission grants still apply,
+        // so record them with every launch for diagnosis from the log alone.
+        AppLog.write("app launched version=\(AppController.appVersionDescription) \(controller.signingIdentity.logDescription) path=\(Bundle.main.bundlePath)")
+        controller.logSigningIdentityChangeSinceLastLaunch()
         configureControllerCallbacks()
         if controller.hotKeyPermissionsAreGranted {
             configureHotKey()

@@ -50,10 +50,10 @@ The UI is intentionally small:
 
 ## Build And Run
 
-Build the native menu bar app:
+Build the native menu bar app. A signing identity is required (certificate name or SHA-1 hash from `security find-identity -v -p codesigning`):
 
 ```bash
-./scripts/build_app.sh
+RESAI_CODESIGN_IDENTITY="<signing identity>" ./scripts/build_app.sh
 ```
 
 Install it:
@@ -115,9 +115,9 @@ dist/installer/ResponseAi-0.4.1.pkg
 dist/installer/ResponseAi-0.4.1.dmg
 ```
 
-If a `Developer ID Application` certificate is installed, `scripts/build_app.sh` uses it for the app bundle and `scripts/build_dmg.sh` signs the DMG. If a `Developer ID Installer` certificate is installed, `scripts/build_pkg.sh` signs the installer package. Without those certificates, the scripts still build unsigned local-testing installers.
+`scripts/build_app.sh` signs the app bundle with the identity in `RESAI_CODESIGN_IDENTITY` and `scripts/build_dmg.sh` signs the DMG with it. If a `Developer ID Installer` certificate is installed, `scripts/build_pkg.sh` signs the installer package. Without those certificates, the scripts still build unsigned local-testing installers.
 
-Set `RESAI_CODESIGN_IDENTITY` explicitly for every release. Keeping the same bundle ID and signing identity across releases prevents macOS from treating an update as a different app and discarding its Accessibility or Input Monitoring grants. Development builds may select a sole installed identity automatically, but stop and require an explicit choice when multiple matching identities are installed.
+`RESAI_CODESIGN_IDENTITY` is required for every build, including local ones; `scripts/build_app.sh` stops if it is unset, set to ad-hoc (`-`), or not found in the keychain. It never picks a certificate on its own. macOS matches Accessibility and Input Monitoring grants against the signing identity, so an update signed by a different certificate (another person's Apple Development certificate, or an ad-hoc signature) is treated as a different app and every user's grants stop applying, while System Settings still shows the old entry switched on. Use the same identity for every release; the script prints the team ID and designated requirement it signed with so a change is visible at build time.
 
 For public distribution outside the Mac App Store, notarize and staple the signed artifacts:
 
