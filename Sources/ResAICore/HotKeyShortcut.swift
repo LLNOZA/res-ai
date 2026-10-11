@@ -130,20 +130,18 @@ public struct HotKeyShortcut: Codable, Hashable, Sendable {
             .joined(separator: " + ")
     }
 
-    /// Shape a stored shortcut must have to be registered at all. Policy rules
-    /// (reserved system shortcuts, ⇧-only) apply only when recording, so a
-    /// migrated setting such as ⌘ + Space is never silently changed.
+    /// Shape a stored shortcut must have to be registered at all. Anything else
+    /// (no modifier, ⇧ only, system shortcuts) is allowed after a warning.
     var isRegistrable: Bool {
-        KeyCodeNames.isSupportedKey(keyCode)
-            && !modifiers.contains(.function)
-            && (!modifiers.isEmpty || KeyCodeNames.isFunctionKey(keyCode))
+        KeyCodeNames.isSupportedKey(keyCode) && !modifiers.contains(.function)
     }
 }
 
-/// What a recorder field produces: a key combination, or (voice only) modifiers alone.
+/// What a recorder field produces: a key combination, or modifiers alone.
 public enum ShortcutTrigger: Hashable, Sendable {
     case key(HotKeyShortcut)
-    /// Modifier-only chord such as fn + ⌘. Detected from `flagsChanged`, never swallowed.
+    /// Modifier-only chord such as fn + ⌘ or a single ⌃. Detected from
+    /// `flagsChanged`, never swallowed.
     case modifierChord(ShortcutModifiers)
 
     public static let fnCommand = ShortcutTrigger.modifierChord([.function, .command])
@@ -169,7 +167,90 @@ public enum ShortcutTrigger: Hashable, Sendable {
         case .key(let shortcut):
             shortcut.isRegistrable
         case .modifierChord(let modifiers):
-            modifiers.count >= 2
+            !modifiers.isEmpty
+        }
+    }
+
+    /// What the user gives up with this trigger, or nil when nothing is lost.
+    public var warning: ShortcutWarning? {
+        warning(layout: .current)
+    }
+
+    public func warning(layout: KeyboardLayout?) -> ShortcutWarning? {
+        switch self {
+        case .modifierChord:
+            return .modifierOnly(displayName)
+        case .key(let shortcut):
+            let keyName = KeyCodeNames.displayName(forKeyCode: shortcut.keyCode, layout: layout)
+            let typesCharacter = KeyCodeNames.typesCharacter(shortcut.keyCode)
+            if shortcut.modifiers.isEmpty {
+                return typesCharacter ? .typesCharacter(keyName) : .replacesKey(keyName)
+            }
+            if shortcut.modifiers == [.shift] {
+                let name = shortcut.displayName(layout: layout)
+                guard typesCharacter else {
+                    return .replacesKey(name)
+                }
+                let character = layout?.character(forKeyCode: shortcut.keyCode) ?? keyName
+                let isLetter = character.lowercased() != character.uppercased()
+                return isLetter ? .uppercase(keyName) : .shiftedCharacter(name)
+            }
+            if let reserved = ReservedShortcut.matching(shortcut) {
+                return .reserved(reserved.name)
+            }
+            return nil
+        }
+    }
+}
+
+/// Shown as a confirmation before registering, then as a gray note under the row.
+public enum ShortcutWarning: Equatable, Sendable {
+    /// A character key alone, e.g. J.
+    case typesCharacter(String)
+    /// A non-character key alone or with ⇧ only, e.g. F5, Space, ⇧ + ←.
+    case replacesKey(String)
+    /// ⇧ + letter.
+    case uppercase(String)
+    /// ⇧ + a non-letter character key, e.g. ⇧ + 1.
+    case shiftedCharacter(String)
+    /// One of `ReservedShortcut.all`.
+    case reserved(String)
+    /// Modifiers alone, e.g. ⌘ + ⇧.
+    case modifierOnly(String)
+
+    /// Sentence for the confirmation dialog.
+    public var confirmationMessage: String {
+        switch self {
+        case .typesCharacter(let key):
+            "この組み合わせにすると「\(key)」が入力できなくなります。登録しますか？"
+        case .replacesKey(let key):
+            "この組み合わせにすると \(key) 本来の動作ができなくなります。登録しますか？"
+        case .uppercase(let key):
+            "この組み合わせにすると大文字の「\(key)」が入力できなくなります。登録しますか？"
+        case .shiftedCharacter(let combination):
+            "この組み合わせにすると \(combination) で入力する記号が入力できなくなります。登録しますか？"
+        case .reserved(let name):
+            "この組み合わせにすると macOS・定番のショートカット（\(name)）が使えなくなります。登録しますか？"
+        case .modifierOnly(let combination):
+            "\(combination) を単独で押して離したときに動作します。押している間に他のキーやクリックをしたときは動作しません。登録しますか？"
+        }
+    }
+
+    /// Note kept under the settings row after the user agreed.
+    public var note: String {
+        switch self {
+        case .typesCharacter(let key):
+            "「\(key)」が入力できなくなっています"
+        case .replacesKey(let key):
+            "\(key) 本来の動作ができなくなっています"
+        case .uppercase(let key):
+            "大文字の「\(key)」が入力できなくなっています"
+        case .shiftedCharacter(let combination):
+            "\(combination) で入力する記号が入力できなくなっています"
+        case .reserved(let name):
+            "macOS・定番のショートカット（\(name)）が使えなくなっています"
+        case .modifierOnly(let combination):
+            "\(combination) を単独で押して離したときに動作します"
         }
     }
 }
@@ -189,7 +270,9 @@ extension ShortcutTrigger: Codable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let modifiers = try container.decode(ShortcutModifiers.self, forKey: .modifiers)
-        switch try container.decode(Kind.self, forKey: .type) {
+        // Non-voice actions stored a bare `HotKeyShortcut` (no "type") before
+        // they could use modifier-only chords.
+        switch try container.decodeIfPresent(Kind.self, forKey: .type) ?? .key {
         case .key:
             let keyCode = try container.decode(UInt32.self, forKey: .keyCode)
             self = .key(HotKeyShortcut(keyCode: keyCode, modifiers: modifiers))
@@ -230,15 +313,10 @@ public enum ShortcutAction: String, CaseIterable, Identifiable, Sendable {
         case .quickMenu: "メニュー"
         }
     }
-
-    /// Only voice input may use modifiers alone; for the others a bare ⌘⇧ would
-    /// fire in the middle of ordinary typing.
-    public var allowsModifierOnly: Bool {
-        self == .voice
-    }
 }
 
-/// A macOS or commonly used app shortcut that ResponseAi refuses to take over.
+/// A macOS or commonly used app shortcut. Taking one over is allowed after a
+/// warning (`ShortcutWarning.reserved`).
 public struct ReservedShortcut: Equatable, Sendable {
     public let shortcut: HotKeyShortcut
     public let name: String
@@ -290,53 +368,43 @@ public struct ReservedShortcut: Equatable, Sendable {
     }
 }
 
+/// Only these are refused; every other combination is allowed (some after a
+/// `ShortcutWarning` confirmation).
 public enum ShortcutValidationError: LocalizedError, Equatable {
-    case missingModifier
-    case shiftOnly
-    case modifierOnlyNotAllowed
-    case tooFewModifiers
+    case nothingPressed
     case unsupportedKey
     case duplicate(ShortcutAction)
-    case reserved(String)
 
     public var errorDescription: String? {
         switch self {
-        case .missingModifier:
-            "修飾キー（⌘ ⌥ ⌃ ⇧）と一緒に押してください。修飾キーなしで使えるのは F1〜F12 だけです。"
-        case .shiftOnly:
-            "⇧ だけでは通常の入力（大文字など）と区別できません。⌘ ⌥ ⌃ のどれかを加えてください。"
-        case .modifierOnlyNotAllowed:
-            "修飾キーだけの組み合わせは音声入力でのみ使えます。文字などのキーも一緒に押してください。"
-        case .tooFewModifiers:
-            "修飾キーだけで登録するときは 2 つ以上を同時に押してください（例: fn + ⌘）。"
+        case .nothingPressed:
+            "キーが押されていません。"
         case .unsupportedKey:
             "このキーはショートカットに使えません。"
         case .duplicate(let action):
             "「\(action.displayName)」で使用中です。"
-        case .reserved(let name):
-            "macOS・定番のショートカット（\(name)）と重なるため使えません。"
         }
     }
 }
 
 public struct AppShortcuts: Codable, Equatable {
-    public var rewrite: HotKeyShortcut
-    public var restore: HotKeyShortcut
-    public var formFill: HotKeyShortcut
-    public var quickMenu: HotKeyShortcut
+    public var rewrite: ShortcutTrigger
+    public var restore: ShortcutTrigger
+    public var formFill: ShortcutTrigger
+    public var quickMenu: ShortcutTrigger
     public var voiceTrigger: ShortcutTrigger
 
-    public static let defaultRewrite = HotKeyShortcut.commandShift(kVK_ANSI_J)
-    public static let defaultRestore = HotKeyShortcut.commandShift(kVK_ANSI_U)
-    public static let defaultFormFill = HotKeyShortcut.commandShift(kVK_ANSI_K)
-    public static let defaultQuickMenu = HotKeyShortcut.commandShift(kVK_ANSI_V)
+    public static let defaultRewrite = ShortcutTrigger.key(.commandShift(kVK_ANSI_J))
+    public static let defaultRestore = ShortcutTrigger.key(.commandShift(kVK_ANSI_U))
+    public static let defaultFormFill = ShortcutTrigger.key(.commandShift(kVK_ANSI_K))
+    public static let defaultQuickMenu = ShortcutTrigger.key(.commandShift(kVK_ANSI_V))
     public static let defaultVoiceTrigger = ShortcutTrigger.key(.commandShift(kVK_Space))
 
     public init(
-        rewrite: HotKeyShortcut = AppShortcuts.defaultRewrite,
-        restore: HotKeyShortcut = AppShortcuts.defaultRestore,
-        formFill: HotKeyShortcut = AppShortcuts.defaultFormFill,
-        quickMenu: HotKeyShortcut = AppShortcuts.defaultQuickMenu,
+        rewrite: ShortcutTrigger = AppShortcuts.defaultRewrite,
+        restore: ShortcutTrigger = AppShortcuts.defaultRestore,
+        formFill: ShortcutTrigger = AppShortcuts.defaultFormFill,
+        quickMenu: ShortcutTrigger = AppShortcuts.defaultQuickMenu,
         voiceTrigger: ShortcutTrigger = AppShortcuts.defaultVoiceTrigger
     ) {
         self.rewrite = rewrite
@@ -353,29 +421,21 @@ public struct AppShortcuts: Codable, Equatable {
     public func trigger(for action: ShortcutAction) -> ShortcutTrigger {
         switch action {
         case .voice: voiceTrigger
-        case .rewrite: .key(rewrite)
-        case .restore: .key(restore)
-        case .formFill: .key(formFill)
-        case .quickMenu: .key(quickMenu)
+        case .rewrite: rewrite
+        case .restore: restore
+        case .formFill: formFill
+        case .quickMenu: quickMenu
         }
     }
 
-    /// Stores `trigger` for `action`. Modifier-only chords are ignored for
-    /// actions other than voice; call `validationError` first.
+    /// Stores `trigger` for `action`; call `validationError` first.
     public mutating func set(_ trigger: ShortcutTrigger, for action: ShortcutAction) {
-        if action == .voice {
-            voiceTrigger = trigger
-            return
-        }
-        guard case .key(let shortcut) = trigger else {
-            return
-        }
         switch action {
-        case .voice: break
-        case .rewrite: rewrite = shortcut
-        case .restore: restore = shortcut
-        case .formFill: formFill = shortcut
-        case .quickMenu: quickMenu = shortcut
+        case .voice: voiceTrigger = trigger
+        case .rewrite: rewrite = trigger
+        case .restore: restore = trigger
+        case .formFill: formFill = trigger
+        case .quickMenu: quickMenu = trigger
         }
     }
 
@@ -384,29 +444,17 @@ public struct AppShortcuts: Codable, Equatable {
     }
 
     /// Why `trigger` cannot be recorded for `action`, or nil when it can.
+    /// Risky but usable combinations are reported by `ShortcutTrigger.warning`.
     public func validationError(for trigger: ShortcutTrigger, action: ShortcutAction) -> ShortcutValidationError? {
-        let shortcut: HotKeyShortcut
         switch trigger {
         case .modifierChord(let modifiers):
-            guard action.allowsModifierOnly else {
-                return .modifierOnlyNotAllowed
+            if modifiers.isEmpty {
+                return .nothingPressed
             }
-            return modifiers.count >= 2 ? nil : .tooFewModifiers
-        case .key(let key):
-            shortcut = key
-        }
-
-        guard KeyCodeNames.isSupportedKey(shortcut.keyCode), !shortcut.modifiers.contains(.function) else {
-            return .unsupportedKey
-        }
-        if shortcut.modifiers.isEmpty && !KeyCodeNames.isFunctionKey(shortcut.keyCode) {
-            return .missingModifier
-        }
-        if shortcut.modifiers == [.shift] && !KeyCodeNames.isFunctionKey(shortcut.keyCode) {
-            return .shiftOnly
-        }
-        if let reserved = ReservedShortcut.matching(shortcut) {
-            return .reserved(reserved.name)
+        case .key(let shortcut):
+            guard shortcut.isRegistrable else {
+                return .unsupportedKey
+            }
         }
         for other in ShortcutAction.allCases where other != action {
             if self.trigger(for: other) == trigger {
@@ -417,54 +465,43 @@ public struct AppShortcuts: Codable, Equatable {
     }
 
     public var hasConflicts: Bool {
-        let keys = ShortcutAction.allCases.compactMap { trigger(for: $0).keyShortcut }
-        return Set(keys).count < keys.count
+        let triggers = ShortcutAction.allCases.map { trigger(for: $0) }
+        return Set(triggers).count < triggers.count
     }
 
     /// Repairs stored data that cannot be registered: unusable shapes and
     /// duplicates fall back to the defaults (then to other free ⌘ + ⇧ letters).
     public func sanitized() -> AppShortcuts {
         var sanitized = self
-        var used = Set<HotKeyShortcut>()
-        sanitized.rewrite = uniqueShortcut(rewrite, fallback: Self.defaultRewrite, used: &used)
-        sanitized.restore = uniqueShortcut(restore, fallback: Self.defaultRestore, used: &used)
-        sanitized.formFill = uniqueShortcut(formFill, fallback: Self.defaultFormFill, used: &used)
-        sanitized.quickMenu = uniqueShortcut(quickMenu, fallback: Self.defaultQuickMenu, used: &used)
-        switch voiceTrigger {
-        case .modifierChord:
-            if !voiceTrigger.isRegistrable {
-                sanitized.voiceTrigger = .fnCommand
-            }
-        case .key(let shortcut):
-            if shortcut.isRegistrable, !used.contains(shortcut) {
-                break
-            }
-            if case .key(let fallback) = Self.defaultVoiceTrigger, !used.contains(fallback) {
-                sanitized.voiceTrigger = Self.defaultVoiceTrigger
-            } else {
-                // A modifier-only chord can never collide with a key shortcut.
-                sanitized.voiceTrigger = .fnCommand
-            }
-        }
+        var used = Set<ShortcutTrigger>()
+        sanitized.rewrite = uniqueTrigger(rewrite, fallbacks: [Self.defaultRewrite], used: &used)
+        sanitized.restore = uniqueTrigger(restore, fallbacks: [Self.defaultRestore], used: &used)
+        sanitized.formFill = uniqueTrigger(formFill, fallbacks: [Self.defaultFormFill], used: &used)
+        sanitized.quickMenu = uniqueTrigger(quickMenu, fallbacks: [Self.defaultQuickMenu], used: &used)
+        sanitized.voiceTrigger = uniqueTrigger(
+            voiceTrigger,
+            fallbacks: [Self.defaultVoiceTrigger, .fnCommand],
+            used: &used
+        )
         return sanitized
     }
 
-    private func uniqueShortcut(
-        _ shortcut: HotKeyShortcut,
-        fallback: HotKeyShortcut,
-        used: inout Set<HotKeyShortcut>
-    ) -> HotKeyShortcut {
-        if shortcut.isRegistrable, used.insert(shortcut).inserted {
-            return shortcut
+    private func uniqueTrigger(
+        _ trigger: ShortcutTrigger,
+        fallbacks: [ShortcutTrigger],
+        used: inout Set<ShortcutTrigger>
+    ) -> ShortcutTrigger {
+        if trigger.isRegistrable, used.insert(trigger).inserted {
+            return trigger
         }
 
-        if used.insert(fallback).inserted {
+        for fallback in fallbacks where used.insert(fallback).inserted {
             return fallback
         }
 
         let firstAvailable = Self.fallbackLetters
-            .map { HotKeyShortcut.commandShift($0) }
-            .first { !used.contains($0) } ?? fallback
+            .map { ShortcutTrigger.key(.commandShift($0)) }
+            .first { !used.contains($0) } ?? fallbacks[0]
         used.insert(firstAvailable)
         return firstAvailable
     }
@@ -486,21 +523,39 @@ public struct AppShortcuts: Codable, Equatable {
                 debugDescription: "Unsupported shortcut format \(version)"
             )
         }
-        rewrite = try container.decodeIfPresent(HotKeyShortcut.self, forKey: .rewrite) ?? Self.defaultRewrite
-        restore = try container.decodeIfPresent(HotKeyShortcut.self, forKey: .restore) ?? Self.defaultRestore
-        formFill = try container.decodeIfPresent(HotKeyShortcut.self, forKey: .formFill) ?? Self.defaultFormFill
-        quickMenu = try container.decodeIfPresent(HotKeyShortcut.self, forKey: .quickMenu) ?? Self.defaultQuickMenu
+        rewrite = try container.decodeIfPresent(ShortcutTrigger.self, forKey: .rewrite) ?? Self.defaultRewrite
+        restore = try container.decodeIfPresent(ShortcutTrigger.self, forKey: .restore) ?? Self.defaultRestore
+        formFill = try container.decodeIfPresent(ShortcutTrigger.self, forKey: .formFill) ?? Self.defaultFormFill
+        quickMenu = try container.decodeIfPresent(ShortcutTrigger.self, forKey: .quickMenu) ?? Self.defaultQuickMenu
         voiceTrigger = try container.decodeIfPresent(ShortcutTrigger.self, forKey: .voice) ?? Self.defaultVoiceTrigger
     }
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(Self.formatVersion, forKey: .version)
-        try container.encode(rewrite, forKey: .rewrite)
-        try container.encode(restore, forKey: .restore)
-        try container.encode(formFill, forKey: .formFill)
-        try container.encode(quickMenu, forKey: .quickMenu)
+        try container.encode(UntypedKeyTrigger(rewrite), forKey: .rewrite)
+        try container.encode(UntypedKeyTrigger(restore), forKey: .restore)
+        try container.encode(UntypedKeyTrigger(formFill), forKey: .formFill)
+        try container.encode(UntypedKeyTrigger(quickMenu), forKey: .quickMenu)
         try container.encode(voiceTrigger, forKey: .voice)
+    }
+
+    /// Writes key shortcuts of the non-voice actions in their original bare
+    /// shape (`{"keyCode":…,"modifiers":[…]}`); chords carry `"type"`.
+    private struct UntypedKeyTrigger: Encodable {
+        let trigger: ShortcutTrigger
+
+        init(_ trigger: ShortcutTrigger) {
+            self.trigger = trigger
+        }
+
+        func encode(to encoder: Encoder) throws {
+            if case .key(let shortcut) = trigger {
+                try shortcut.encode(to: encoder)
+            } else {
+                try trigger.encode(to: encoder)
+            }
+        }
     }
 
     /// Reads `shortcuts.v2`; when it has never been written, converts the
@@ -611,10 +666,10 @@ private struct LegacyShortcutsV1: Decodable {
             trigger = .key(HotKeyShortcut(keyCode: UInt32(kVK_Space), modifiers: [.command]))
         }
         return AppShortcuts(
-            rewrite: .commandShift((rewrite?.key ?? .j).keyCode),
-            restore: .commandShift((restore?.key ?? .u).keyCode),
-            formFill: .commandShift((formFill?.key ?? .k).keyCode),
-            quickMenu: .commandShift((quickMenu?.key ?? .v).keyCode),
+            rewrite: .key(.commandShift((rewrite?.key ?? .j).keyCode)),
+            restore: .key(.commandShift((restore?.key ?? .u).keyCode)),
+            formFill: .key(.commandShift((formFill?.key ?? .k).keyCode)),
+            quickMenu: .key(.commandShift((quickMenu?.key ?? .v).keyCode)),
             voiceTrigger: trigger
         )
     }

@@ -42,6 +42,7 @@ public final class GlobalHotKeyManager: @unchecked Sendable {
     private var requiredFlags: CGEventFlags = [.maskCommand, .maskShift]
     private let callback: @Sendable () -> Void
     private let releaseCallback: (@Sendable () -> Void)?
+    private let cancelCallback: (@Sendable () -> Void)?
     /// Diagnostic hook: fired after the tap was re-enabled following a system disable.
     public var onTapReenabled: (@Sendable () -> Void)?
     /// Diagnostic hook with the actual reason supplied by Core Graphics. This is
@@ -50,8 +51,11 @@ public final class GlobalHotKeyManager: @unchecked Sendable {
     private var isPressed = false
     private var _isSuspended = false
     private var isModifierChordMode = false
+    private var _modifierChordStyle: ModifierChordDetector.Style = .tap
     /// Only touched from the event-tap callback thread. See type comment above.
     private var chordDetector = ModifierChordDetector(requiredFlags: [.maskSecondaryFn, .maskCommand])
+    /// Value of `swallowedKeyDowns` the chord detector has already accounted for.
+    private var seenSwallowedKeyDowns: UInt64 = 0
     private var storedRegistration: StoredRegistration?
     private var lastEventAt: TimeInterval = 0
     private var _registrationGeneration: UInt64 = 0
@@ -61,12 +65,51 @@ public final class GlobalHotKeyManager: @unchecked Sendable {
         case chord(CGEventFlags)
     }
 
+    /// Key-down events any manager swallowed. Every tap runs on the same
+    /// event-tap thread, and a swallowed key never reaches the taps behind it, so
+    /// a modifier-only chord learns about ⌘⇧J (taken by another shortcut) here.
+    private static let swallowLock = NSLock()
+    nonisolated(unsafe) private static var _swallowedKeyDowns: UInt64 = 0
+
+    private static var swallowedKeyDowns: UInt64 {
+        swallowLock.lock()
+        defer { swallowLock.unlock() }
+        return _swallowedKeyDowns
+    }
+
+    private static func noteSwallowedKeyDown() {
+        swallowLock.lock()
+        _swallowedKeyDowns &+= 1
+        swallowLock.unlock()
+    }
+
     /// `callback` fires once per physical press (autorepeat is ignored). When `onRelease` is
     /// supplied, the tap also listens for the matching keyUp so callers can implement
-    /// push-to-talk style interactions.
-    public init(callback: @escaping @Sendable () -> Void, onRelease: (@Sendable () -> Void)? = nil) {
+    /// push-to-talk style interactions. `onCancel` fires when a held modifier-only chord
+    /// (`.hold` style) turns out to be part of another shortcut; no release follows.
+    public init(
+        callback: @escaping @Sendable () -> Void,
+        onRelease: (@Sendable () -> Void)? = nil,
+        onCancel: (@Sendable () -> Void)? = nil
+    ) {
         self.callback = callback
         self.releaseCallback = onRelease
+        self.cancelCallback = onCancel
+    }
+
+    /// How a modifier-only chord fires. `.tap` (default) calls `callback` when the
+    /// chord is pressed alone and let go; `.hold` reports press, release and cancel.
+    public var modifierChordStyle: ModifierChordDetector.Style {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _modifierChordStyle
+        }
+        set {
+            lock.lock()
+            _modifierChordStyle = newValue
+            lock.unlock()
+        }
     }
 
     deinit {
@@ -106,19 +149,28 @@ public final class GlobalHotKeyManager: @unchecked Sendable {
         storedRegistration = .key(code: keyCode, modifiers: modifiers)
     }
 
-    /// Modifier-only chord (voice trigger such as `fn + ⌘`). `flagsChanged` is never swallowed.
+    /// Modifier-only chord such as `fn + ⌘` or `⌃`. `flagsChanged` is never swallowed.
     public func register(modifierChord flags: CGEventFlags, id _: UInt32 = 1) throws {
         unregister()
-
-        isModifierChordMode = true
-        resetStateOnCurrentThread()
-        chordDetector = ModifierChordDetector(requiredFlags: flags)
+        prepareModifierChord(flags)
 
         let mask = CGEventMask(1 << CGEventType.flagsChanged.rawValue)
             | CGEventMask(1 << CGEventType.keyDown.rawValue)
             | CGEventMask(1 << CGEventType.keyUp.rawValue)
+            | CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
+            | CGEventMask(1 << CGEventType.rightMouseDown.rawValue)
+            | CGEventMask(1 << CGEventType.otherMouseDown.rawValue)
         try installTap(mask: mask)
         storedRegistration = .chord(flags)
+    }
+
+    /// Detector state for `register(modifierChord:)`; internal so tests can
+    /// drive `handleModifierChord` without installing a tap.
+    func prepareModifierChord(_ flags: CGEventFlags) {
+        isModifierChordMode = true
+        resetStateOnCurrentThread()
+        chordDetector = ModifierChordDetector(requiredFlags: flags, style: modifierChordStyle)
+        seenSwallowedKeyDowns = Self.swallowedKeyDowns
     }
 
     private func installTap(mask: CGEventMask) throws {
@@ -169,7 +221,7 @@ public final class GlobalHotKeyManager: @unchecked Sendable {
                     // The settings window is recording a new shortcut: let every key
                     // through, and forget a half-pressed chord so resuming starts clean.
                     if manager.isModifierChordMode {
-                        if manager.chordDetector.reset() {
+                        if manager.chordDetector.reset(), manager.chordDetector.style == .hold {
                             manager.setPressedFromTapThread(false)
                             manager.emitReleased()
                         }
@@ -203,6 +255,7 @@ public final class GlobalHotKeyManager: @unchecked Sendable {
                         manager.setPressed(true)
                         manager.emitPressed()
                     }
+                    GlobalHotKeyManager.noteSwallowedKeyDown()
                     return nil
                 }
 
@@ -246,29 +299,41 @@ public final class GlobalHotKeyManager: @unchecked Sendable {
         CGEvent.tapEnable(tap: tap, enable: true)
     }
 
-    private func handleModifierChord(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+    /// Internal (not private) so tests can feed synthesized events without a tap.
+    func handleModifierChord(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         let now = ProcessInfo.processInfo.systemUptime
 
-        if type == .flagsChanged {
-            applyChordAction(chordDetector.handle(flags: event.flags, at: now))
-            return Unmanaged.passUnretained(event)
+        let style = modifierChordStyle
+        if chordDetector.style != style {
+            // Voice activation mode changed in Settings; start from a clean state.
+            chordDetector.reset()
+            setPressedFromTapThread(false)
+            chordDetector.style = style
         }
 
-        if type == .keyDown {
+        let swallowed = Self.swallowedKeyDowns
+        if swallowed != seenSwallowedKeyDowns {
+            seenSwallowedKeyDowns = swallowed
+            applyChordAction(chordDetector.handleKeySwallowedElsewhere())
+        }
+
+        switch type {
+        case .flagsChanged:
+            applyChordAction(chordDetector.handle(flags: event.flags, at: now))
+        case .keyDown:
             if !Self.isModifierKeyCode(event.getIntegerValueField(.keyboardEventKeycode)),
                event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
-                applyChordAction(chordDetector.handleNonModifierKeyDown(at: now))
+                applyChordAction(chordDetector.handleNonModifierKeyDown())
             }
-            return Unmanaged.passUnretained(event)
-        }
-
-        if type == .keyUp {
+        case .keyUp:
             if !Self.isModifierKeyCode(event.getIntegerValueField(.keyboardEventKeycode)) {
                 chordDetector.handleNonModifierKeyUp()
             }
-            return Unmanaged.passUnretained(event)
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            applyChordAction(chordDetector.handleMouseDown())
+        default:
+            break
         }
-
         return Unmanaged.passUnretained(event)
     }
 
@@ -280,8 +345,20 @@ public final class GlobalHotKeyManager: @unchecked Sendable {
         case .released:
             setPressedFromTapThread(false)
             emitReleased()
+        case .cancelled:
+            setPressedFromTapThread(false)
+            emitCancelled()
+        case .tapped:
+            emitPressed()
         case .none:
             break
+        }
+    }
+
+    private func emitCancelled() {
+        let cancelCallback = cancelCallback
+        Task { @MainActor in
+            cancelCallback?()
         }
     }
 
@@ -360,7 +437,7 @@ public final class GlobalHotKeyManager: @unchecked Sendable {
     }
 
     private func resetStateFromTapThread() {
-        let chordWasHeld = isModifierChordMode && chordDetector.reset()
+        let chordWasHeld = isModifierChordMode && chordDetector.reset() && chordDetector.style == .hold
         lock.lock()
         let keyWasHeld = isPressed
         isPressed = false

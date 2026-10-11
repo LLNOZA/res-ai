@@ -12,10 +12,10 @@ final class HotKeyShortcutTests: XCTestCase {
         let shortcuts = AppShortcuts.defaults
         let layout = try XCTUnwrap(usLayout)
 
-        XCTAssertEqual(shortcuts.rewrite.displayName(layout: layout), "⌘ + ⇧ + J")
-        XCTAssertEqual(shortcuts.restore.displayName(layout: layout), "⌘ + ⇧ + U")
-        XCTAssertEqual(shortcuts.formFill.displayName(layout: layout), "⌘ + ⇧ + K")
-        XCTAssertEqual(shortcuts.quickMenu.displayName(layout: layout), "⌘ + ⇧ + V")
+        XCTAssertEqual(shortcuts.rewrite.keyShortcut?.displayName(layout: layout), "⌘ + ⇧ + J")
+        XCTAssertEqual(shortcuts.restore.keyShortcut?.displayName(layout: layout), "⌘ + ⇧ + U")
+        XCTAssertEqual(shortcuts.formFill.keyShortcut?.displayName(layout: layout), "⌘ + ⇧ + K")
+        XCTAssertEqual(shortcuts.quickMenu.keyShortcut?.displayName(layout: layout), "⌘ + ⇧ + V")
         XCTAssertEqual(shortcuts.voiceTrigger, .key(.commandShift(kVK_Space)))
         XCTAssertEqual(shortcuts.voiceTrigger.displayName, "⌘ + ⇧ + Space")
         XCTAssertEqual(ShortcutTrigger.fnCommand.displayName, "fn + ⌘")
@@ -23,35 +23,50 @@ final class HotKeyShortcutTests: XCTestCase {
     }
 
     func testSanitizedShortcutsRemoveConflicts() {
-        let j = HotKeyShortcut.commandShift(kVK_ANSI_J)
+        let j = ShortcutTrigger.key(.commandShift(kVK_ANSI_J))
         let shortcuts = AppShortcuts(rewrite: j, restore: j, formFill: j, quickMenu: j).sanitized()
 
-        XCTAssertEqual(shortcuts.rewrite, .commandShift(kVK_ANSI_J))
-        XCTAssertEqual(shortcuts.restore, .commandShift(kVK_ANSI_U))
-        XCTAssertEqual(shortcuts.formFill, .commandShift(kVK_ANSI_K))
-        XCTAssertEqual(shortcuts.quickMenu, .commandShift(kVK_ANSI_V))
+        XCTAssertEqual(shortcuts.rewrite, .key(.commandShift(kVK_ANSI_J)))
+        XCTAssertEqual(shortcuts.restore, .key(.commandShift(kVK_ANSI_U)))
+        XCTAssertEqual(shortcuts.formFill, .key(.commandShift(kVK_ANSI_K)))
+        XCTAssertEqual(shortcuts.quickMenu, .key(.commandShift(kVK_ANSI_V)))
         XCTAssertFalse(shortcuts.hasConflicts)
     }
 
     func testSanitizedMovesCollidingVoiceKeyToDefaultOrChord() {
-        let space = HotKeyShortcut.commandShift(kVK_Space)
-        let shortcuts = AppShortcuts(rewrite: space, voiceTrigger: .key(space)).sanitized()
+        let space = ShortcutTrigger.key(.commandShift(kVK_Space))
+        let shortcuts = AppShortcuts(rewrite: space, voiceTrigger: space).sanitized()
 
-        // ⌘⇧Space is taken by rewrite, so voice falls back to a chord that cannot collide.
+        // ⌘⇧Space is taken by rewrite, so voice falls back to a chord.
         XCTAssertEqual(shortcuts.rewrite, space)
         XCTAssertEqual(shortcuts.voiceTrigger, .fnCommand)
     }
 
-    func testSanitizedKeepsChordVoiceAndRepairsUnregistrableShapes() {
+    func testSanitizedRemovesChordConflictsToo() {
+        let control = ShortcutTrigger.modifierChord([.control])
+        let shortcuts = AppShortcuts(rewrite: control, restore: control, voiceTrigger: control).sanitized()
+
+        XCTAssertEqual(shortcuts.rewrite, control)
+        XCTAssertEqual(shortcuts.restore, AppShortcuts.defaultRestore)
+        XCTAssertEqual(shortcuts.voiceTrigger, AppShortcuts.defaultVoiceTrigger)
+        XCTAssertFalse(shortcuts.hasConflicts)
+    }
+
+    func testSanitizedKeepsAnyRecordableShapeAndRepairsTheRest() {
+        let bareJ = ShortcutTrigger.key(HotKeyShortcut(keyCode: UInt32(kVK_ANSI_J), modifiers: []))
         let shortcuts = AppShortcuts(
-            rewrite: HotKeyShortcut(keyCode: UInt32(kVK_ANSI_J), modifiers: []),
-            restore: HotKeyShortcut(keyCode: UInt32(kVK_Command), modifiers: [.command]),
+            rewrite: bareJ,
+            restore: .key(HotKeyShortcut(keyCode: UInt32(kVK_Command), modifiers: [.command])),
+            formFill: .modifierChord([.option]),
+            quickMenu: .modifierChord([]),
             voiceTrigger: .modifierChord([.command])
         ).sanitized()
 
-        XCTAssertEqual(shortcuts.rewrite, AppShortcuts.defaultRewrite)
+        XCTAssertEqual(shortcuts.rewrite, bareJ)
         XCTAssertEqual(shortcuts.restore, AppShortcuts.defaultRestore)
-        XCTAssertEqual(shortcuts.voiceTrigger, .fnCommand)
+        XCTAssertEqual(shortcuts.formFill, .modifierChord([.option]))
+        XCTAssertEqual(shortcuts.quickMenu, AppShortcuts.defaultQuickMenu)
+        XCTAssertEqual(shortcuts.voiceTrigger, .modifierChord([.command]))
     }
 
     // MARK: Persistence
@@ -60,10 +75,10 @@ final class HotKeyShortcutTests: XCTestCase {
         let defaults = try freshDefaults("HotKeyShortcutTests")
 
         let shortcuts = AppShortcuts(
-            rewrite: HotKeyShortcut(keyCode: UInt32(kVK_ANSI_R), modifiers: [.command, .option]),
-            restore: HotKeyShortcut(keyCode: UInt32(kVK_F5), modifiers: []),
-            formFill: HotKeyShortcut(keyCode: UInt32(kVK_ANSI_1), modifiers: [.control, .shift]),
-            quickMenu: HotKeyShortcut(keyCode: UInt32(kVK_LeftArrow), modifiers: [.command, .control]),
+            rewrite: .key(HotKeyShortcut(keyCode: UInt32(kVK_ANSI_R), modifiers: [.command, .option])),
+            restore: .key(HotKeyShortcut(keyCode: UInt32(kVK_F5), modifiers: [])),
+            formFill: .modifierChord([.control]),
+            quickMenu: .key(HotKeyShortcut(keyCode: UInt32(kVK_LeftArrow), modifiers: [.command, .control])),
             voiceTrigger: .modifierChord([.function, .option, .command])
         )
         shortcuts.save(defaults: defaults)
@@ -72,16 +87,43 @@ final class HotKeyShortcutTests: XCTestCase {
     }
 
     func testSavedPayloadUsesReadableVersionedFormat() throws {
-        let data = try JSONEncoder().encode(AppShortcuts(voiceTrigger: .fnCommand))
+        let data = try JSONEncoder().encode(AppShortcuts(restore: .modifierChord([.control]), voiceTrigger: .fnCommand))
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
 
         XCTAssertEqual(object["version"] as? Int, 2)
+        // Key shortcuts of the non-voice actions keep the original bare shape.
         let rewrite = try XCTUnwrap(object["rewrite"] as? [String: Any])
         XCTAssertEqual(rewrite["keyCode"] as? Int, kVK_ANSI_J)
         XCTAssertEqual(rewrite["modifiers"] as? [String], ["command", "shift"])
+        XCTAssertNil(rewrite["type"])
+        let restore = try XCTUnwrap(object["restore"] as? [String: Any])
+        XCTAssertEqual(restore["type"] as? String, "modifiers")
+        XCTAssertEqual(restore["modifiers"] as? [String], ["control"])
         let voice = try XCTUnwrap(object["voice"] as? [String: Any])
         XCTAssertEqual(voice["type"] as? String, "modifiers")
         XCTAssertEqual(voice["modifiers"] as? [String], ["function", "command"])
+    }
+
+    func testV2PayloadWrittenBeforeChordsForAllActionsStillLoads() throws {
+        let defaults = try freshDefaults("HotKeyShortcutEarlierV2")
+        defaults.set(Data("""
+            {
+              "version": 2,
+              "rewrite": { "keyCode": \(kVK_ANSI_R), "modifiers": ["command", "option"] },
+              "restore": { "keyCode": \(kVK_F5), "modifiers": [] },
+              "formFill": { "keyCode": \(kVK_ANSI_K), "modifiers": ["command", "shift"] },
+              "quickMenu": { "keyCode": \(kVK_ANSI_V), "modifiers": ["command", "shift"] },
+              "voice": { "type": "key", "keyCode": \(kVK_Space), "modifiers": ["command"] }
+            }
+            """.utf8), forKey: AppShortcuts.DefaultsKey.shortcuts)
+
+        let shortcuts = AppShortcuts.load(defaults: defaults)
+
+        XCTAssertEqual(shortcuts.rewrite, .key(HotKeyShortcut(keyCode: UInt32(kVK_ANSI_R), modifiers: [.command, .option])))
+        XCTAssertEqual(shortcuts.restore, .key(HotKeyShortcut(keyCode: UInt32(kVK_F5), modifiers: [])))
+        XCTAssertEqual(shortcuts.formFill, AppShortcuts.defaultFormFill)
+        XCTAssertEqual(shortcuts.quickMenu, AppShortcuts.defaultQuickMenu)
+        XCTAssertEqual(shortcuts.voiceTrigger, .key(HotKeyShortcut(keyCode: UInt32(kVK_Space), modifiers: [.command])))
     }
 
     func testSavingWritesV2AndLeavesLegacyPayloadAlone() throws {
@@ -113,10 +155,10 @@ final class HotKeyShortcutTests: XCTestCase {
 
         let shortcuts = AppShortcuts.load(defaults: defaults)
 
-        XCTAssertEqual(shortcuts.rewrite, .commandShift(kVK_ANSI_R))
-        XCTAssertEqual(shortcuts.restore, .commandShift(kVK_ANSI_Y))
-        XCTAssertEqual(shortcuts.formFill, .commandShift(kVK_ANSI_F))
-        XCTAssertEqual(shortcuts.quickMenu, .commandShift(kVK_ANSI_M))
+        XCTAssertEqual(shortcuts.rewrite, .key(.commandShift(kVK_ANSI_R)))
+        XCTAssertEqual(shortcuts.restore, .key(.commandShift(kVK_ANSI_Y)))
+        XCTAssertEqual(shortcuts.formFill, .key(.commandShift(kVK_ANSI_F)))
+        XCTAssertEqual(shortcuts.quickMenu, .key(.commandShift(kVK_ANSI_M)))
         XCTAssertEqual(shortcuts.voiceTrigger, .key(.commandShift(kVK_ANSI_A)))
         XCTAssertEqual(shortcuts.voiceTrigger.keyShortcut?.displayName(layout: usLayout), "⌘ + ⇧ + A")
     }
@@ -175,10 +217,10 @@ final class HotKeyShortcutTests: XCTestCase {
 
         let shortcuts = AppShortcuts.load(defaults: defaults)
 
-        XCTAssertEqual(shortcuts.rewrite, .commandShift(kVK_ANSI_R))
-        XCTAssertEqual(shortcuts.restore, .commandShift(kVK_ANSI_Y))
-        XCTAssertEqual(shortcuts.formFill, .commandShift(kVK_ANSI_F))
-        XCTAssertEqual(shortcuts.quickMenu, .commandShift(kVK_ANSI_V))
+        XCTAssertEqual(shortcuts.rewrite, .key(.commandShift(kVK_ANSI_R)))
+        XCTAssertEqual(shortcuts.restore, .key(.commandShift(kVK_ANSI_Y)))
+        XCTAssertEqual(shortcuts.formFill, .key(.commandShift(kVK_ANSI_F)))
+        XCTAssertEqual(shortcuts.quickMenu, .key(.commandShift(kVK_ANSI_V)))
         XCTAssertEqual(shortcuts.voiceTrigger, AppShortcuts.defaultVoiceTrigger)
     }
 

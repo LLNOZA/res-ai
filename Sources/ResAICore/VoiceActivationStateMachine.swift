@@ -11,12 +11,17 @@ public struct VoiceActivationStateMachine: Equatable, Sendable {
     public enum Event: Equatable, Sendable {
         case keyDown(at: TimeInterval)
         case keyUp(at: TimeInterval)
+        /// The held trigger (a modifier-only chord) turned out to be part of
+        /// another shortcut, e.g. ⌘⇧T while ⌘⇧ is the trigger.
+        case cancelled
         case finished
     }
 
     public enum Action: Equatable, Sendable {
         case startListening
         case confirm
+        /// Drop the session started by this press without inserting anything.
+        case cancel
         case none
     }
 
@@ -31,7 +36,15 @@ public struct VoiceActivationStateMachine: Equatable, Sendable {
             state = .holding(since: at)
             return .startListening
 
-        case (.idle, .keyUp), (.idle, .finished):
+        case (.idle, .keyUp), (.idle, .cancelled), (.idle, .finished):
+            return .none
+
+        case (.holding, .cancelled):
+            state = .idle
+            return .cancel
+
+        case (.toggled, .cancelled):
+            // The cancelled press was not the one that started this session.
             return .none
 
         case (.holding(let since), .keyUp(let at)):

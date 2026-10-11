@@ -5,7 +5,9 @@ import SwiftUI
 
 /// Click-to-record shortcut field, like System Settings > Keyboard Shortcuts.
 /// Clicking starts recording; the next key combination is reported through
-/// `onCapture`. Esc (or leaving the window) cancels.
+/// `onCapture`. Modifiers pressed and let go on their own are recorded as a
+/// modifier-only chord. Esc (or leaving the window) cancels; the
+/// "Esc を登録" button records Esc itself.
 struct ShortcutRecorderField: View {
     let displayName: String
     let isRecording: Bool
@@ -14,6 +16,20 @@ struct ShortcutRecorderField: View {
     let onCancel: () -> Void
 
     var body: some View {
+        HStack(spacing: 6) {
+            field
+            if isRecording {
+                Button("Esc を登録") {
+                    onCapture(.key(HotKeyShortcut(keyCode: UInt32(kVK_Escape), modifiers: [])))
+                }
+                .controlSize(.small)
+                // Taking focus would end the recording before the click lands.
+                .focusable(false)
+            }
+        }
+    }
+
+    private var field: some View {
         Button(action: isRecording ? onCancel : onStart) {
             Text(isRecording ? "キーを押してください…" : displayName)
                 .font(.system(size: 12, weight: isRecording ? .regular : .medium))
@@ -65,7 +81,8 @@ final class ShortcutCaptureNSView: NSView {
 
     private var isFinished = false
     /// Largest modifier set held since all modifiers were last up. Released
-    /// without a key in between, it becomes a modifier-only chord.
+    /// without a key in between, it becomes a modifier-only chord (one
+    /// modifier alone is fine).
     private var peakModifiers: ShortcutModifiers = []
     private var sawKeySincePeak = false
     private var resignObserver: NSObjectProtocol?
@@ -128,8 +145,7 @@ final class ShortcutCaptureNSView: NSView {
             let sawKey = sawKeySincePeak
             peakModifiers = []
             sawKeySincePeak = false
-            // A single modifier tapped on its own is just hesitation; keep waiting.
-            if !sawKey, chord.count >= 2 {
+            if !sawKey, !chord.isEmpty {
                 finish(with: .modifierChord(chord))
             }
             return

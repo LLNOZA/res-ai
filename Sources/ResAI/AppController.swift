@@ -36,6 +36,17 @@ final class AppController: ObservableObject {
     var onShortcutsChange: ((AppShortcuts) -> String?)?
     /// Pauses (true) or resumes (false) global shortcuts while a key is being recorded.
     var onShortcutRecordingChange: ((Bool) -> Void)?
+    /// Asks before registering a combination that takes something away
+    /// (J alone, ⌘C, …). Returns true to register.
+    var confirmShortcutWarning: (ShortcutAction, ShortcutTrigger, ShortcutWarning) -> Bool = { action, trigger, warning in
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "「\(action.displayName)」を \(trigger.displayName) にしますか？"
+        alert.informativeText = warning.confirmationMessage
+        alert.addButton(withTitle: "登録")
+        alert.addButton(withTitle: "キャンセル")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
     var onHideHUD: (() -> Void)?
     var onHotKeyPermissionsGranted: (() -> Bool)?
     var shortcutDiagnosticsProvider: (() -> [String])?
@@ -521,9 +532,10 @@ final class AppController: ObservableObject {
         showShortcutChangedHUD(title: "ショートカットを標準に戻しました")
     }
 
-    /// Validates, saves, and registers one recorded shortcut. When the event tap
-    /// cannot be installed the previous shortcuts are restored and the reason shown.
-    private func applyShortcut(_ trigger: ShortcutTrigger, for action: ShortcutAction) {
+    /// Validates, confirms (when the combination takes something away), saves,
+    /// and registers one recorded shortcut. When the event tap cannot be
+    /// installed the previous shortcuts are restored and the reason shown.
+    func applyShortcut(_ trigger: ShortcutTrigger, for action: ShortcutAction) {
         guard shortcuts.trigger(for: action) != trigger else {
             shortcutErrors[action] = nil
             return
@@ -532,6 +544,13 @@ final class AppController: ObservableObject {
             shortcutErrors[action] = error.errorDescription
             AppLog.write("shortcut rejected action=\(action.rawValue) shortcut=\(trigger.displayName) reason=\(error)")
             return
+        }
+        if let warning = trigger.warning {
+            guard confirmShortcutWarning(action, trigger, warning) else {
+                AppLog.write("shortcut warning declined action=\(action.rawValue) shortcut=\(trigger.displayName)")
+                return
+            }
+            AppLog.write("shortcut warning accepted action=\(action.rawValue) shortcut=\(trigger.displayName) warning=\(warning)")
         }
         let previous = shortcuts
         var updated = shortcuts

@@ -387,6 +387,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controller.onShortcutRecordingChange = { [weak self] isRecording in
             self?.setHotKeysSuspended(isRecording)
         }
+        controller.voiceInput.onActivationModeChange = { [weak self] mode in
+            self?.voiceHotKeyManager?.modifierChordStyle = mode.modifierChordStyle
+        }
     }
 
     private func configurePreferencesObservation() {
@@ -699,8 +702,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     AppLog.write("voice hotkey released")
                     self?.controller.voiceInput.hotKeyReleased()
                 }
+            },
+            onCancel: { [weak self] in
+                Task { @MainActor in
+                    guard self?.activeHotKeyConfiguration == configuration else { return }
+                    self?.controller.voiceInput.hotKeyCancelled()
+                }
             }
         )
+        voiceManager.modifierChordStyle = controller.voiceInput.settings.activationMode.modifierChordStyle
 
         let candidates: [(String, GlobalHotKeyManager)] = [
             ("rewrite", rewriteManager), ("restore", restoreManager), ("form", formFillManager),
@@ -1093,6 +1103,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// Modifier-only chords cannot be shown as a key equivalent.
+    private func applyMenuShortcut(_ trigger: ShortcutTrigger, to item: NSMenuItem) {
+        switch trigger {
+        case .key(let shortcut):
+            applyMenuShortcut(shortcut, to: item)
+        case .modifierChord:
+            item.keyEquivalent = ""
+            item.keyEquivalentModifierMask = []
+        }
+    }
+
     private func applyMenuShortcut(_ shortcut: HotKeyShortcut, to item: NSMenuItem) {
         item.keyEquivalent = shortcut.keyEquivalent
         var mask: NSEvent.ModifierFlags = []
@@ -1106,13 +1127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func applyVoiceMenuShortcut(to item: NSMenuItem) {
         let trigger = controller.shortcuts.voiceTrigger
         item.title = voiceMenuTitle(for: trigger)
-        switch trigger {
-        case .key(let shortcut):
-            applyMenuShortcut(shortcut, to: item)
-        case .modifierChord:
-            item.keyEquivalent = ""
-            item.keyEquivalentModifierMask = []
-        }
+        applyMenuShortcut(trigger, to: item)
     }
 
     private func voiceMenuTitle(for trigger: ShortcutTrigger) -> String {

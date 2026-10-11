@@ -185,6 +185,12 @@ public enum KeyCodeNames {
         keyCode <= 0x7F && !isModifierKey(keyCode)
     }
 
+    /// Whether the key types a character on its own (letters, digits, symbols,
+    /// keypad). Space, ↩, arrows, F-keys, Esc and the like do not.
+    public static func typesCharacter(_ keyCode: UInt32) -> Bool {
+        isSupportedKey(keyCode) && specialNames[keyCode] == nil
+    }
+
     public static func displayName(forKeyCode keyCode: UInt32, layout: KeyboardLayout? = .current) -> String {
         if let special = specialNames[keyCode] {
             return special

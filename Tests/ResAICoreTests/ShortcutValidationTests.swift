@@ -4,48 +4,54 @@ import XCTest
 
 final class ShortcutValidationTests: XCTestCase {
     private let shortcuts = AppShortcuts.defaults
+    private let usLayout = KeyboardLayout.installed(
+        id: "com.apple.keylayout.US",
+        keyboardType: KeyboardLayout.keyboardType(physicalLayout: Int(kKeyboardANSI)) ?? 40
+    )
 
     private func key(_ keyCode: Int, _ modifiers: ShortcutModifiers) -> ShortcutTrigger {
         .key(HotKeyShortcut(keyCode: UInt32(keyCode), modifiers: modifiers))
     }
 
-    func testAcceptsFreeModifierCombinations() {
+    // MARK: Rejections: only duplicates and keys that cannot be recorded
+
+    func testAcceptsAnyCombinationForEveryAction() {
         let accepted: [ShortcutTrigger] = [
             key(kVK_ANSI_R, [.command, .option]),
             key(kVK_ANSI_1, [.control, .shift]),
             key(kVK_ANSI_Slash, [.command, .control, .option, .shift]),
-            key(kVK_Space, [.option]),
             key(kVK_LeftArrow, [.command, .control]),
-            key(kVK_ANSI_J, [.command]),
-            key(kVK_F5, [.shift])
+            key(kVK_ANSI_J, []),
+            key(kVK_Space, []),
+            key(kVK_F13, []),
+            key(kVK_Escape, []),
+            key(kVK_ANSI_J, [.shift]),
+            key(kVK_ANSI_1, [.shift]),
+            key(kVK_ANSI_C, [.command]),
+            key(kVK_Space, [.command]),
+            .modifierChord([.command]),
+            .modifierChord([.control]),
+            .modifierChord([.function]),
+            .modifierChord([.command, .shift]),
+            .fnCommand
         ]
+        let empty = AppShortcuts(
+            rewrite: key(kVK_F1, [.control, .option, .command]),
+            restore: key(kVK_F2, [.control, .option, .command]),
+            formFill: key(kVK_F3, [.control, .option, .command]),
+            quickMenu: key(kVK_F4, [.control, .option, .command]),
+            voiceTrigger: key(kVK_F5, [.control, .option, .command])
+        )
         for trigger in accepted {
-            XCTAssertNil(shortcuts.validationError(for: trigger, action: .rewrite), trigger.displayName)
+            for action in ShortcutAction.allCases {
+                XCTAssertNil(empty.validationError(for: trigger, action: action), "\(action) \(trigger.displayName)")
+            }
         }
-    }
-
-    func testRejectsKeyWithoutModifierExceptF1ToF12() {
-        XCTAssertEqual(shortcuts.validationError(for: key(kVK_ANSI_J, []), action: .rewrite), .missingModifier)
-        XCTAssertEqual(shortcuts.validationError(for: key(kVK_Space, []), action: .voice), .missingModifier)
-        XCTAssertEqual(shortcuts.validationError(for: key(kVK_F13, []), action: .rewrite), .missingModifier)
-        for code in KeyCodeNames.functionKeyCodes {
-            XCTAssertNil(
-                shortcuts.validationError(for: .key(HotKeyShortcut(keyCode: code, modifiers: [])), action: .formFill),
-                "F-key \(code)"
-            )
-        }
-    }
-
-    func testRejectsShiftOnlyWithCharacterKeys() {
-        XCTAssertEqual(shortcuts.validationError(for: key(kVK_ANSI_J, [.shift]), action: .rewrite), .shiftOnly)
-        XCTAssertEqual(shortcuts.validationError(for: key(kVK_ANSI_1, [.shift]), action: .restore), .shiftOnly)
-        XCTAssertEqual(shortcuts.validationError(for: key(kVK_Space, [.shift]), action: .voice), .shiftOnly)
-        XCTAssertNil(shortcuts.validationError(for: key(kVK_ANSI_J, [.shift, .option]), action: .rewrite))
     }
 
     func testRejectsDuplicatesAcrossActions() {
         XCTAssertEqual(
-            shortcuts.validationError(for: .key(AppShortcuts.defaultRestore), action: .rewrite),
+            shortcuts.validationError(for: AppShortcuts.defaultRestore, action: .rewrite),
             .duplicate(.restore)
         )
         XCTAssertEqual(
@@ -53,23 +59,92 @@ final class ShortcutValidationTests: XCTestCase {
             .duplicate(.voice)
         )
         XCTAssertEqual(
-            shortcuts.validationError(for: .key(AppShortcuts.defaultRewrite), action: .voice),
+            shortcuts.validationError(for: AppShortcuts.defaultRewrite, action: .voice),
             .duplicate(.rewrite)
         )
+        var withChord = shortcuts
+        withChord.set(.modifierChord([.control]), for: .restore)
+        XCTAssertEqual(
+            withChord.validationError(for: .modifierChord([.control]), action: .formFill),
+            .duplicate(.restore)
+        )
         // Re-recording an action's own shortcut is not a conflict.
-        XCTAssertNil(shortcuts.validationError(for: .key(AppShortcuts.defaultRewrite), action: .rewrite))
+        XCTAssertNil(shortcuts.validationError(for: AppShortcuts.defaultRewrite, action: .rewrite))
     }
 
-    func testRejectsEveryReservedSystemShortcut() {
-        for reserved in ReservedShortcut.all {
-            for action in ShortcutAction.allCases {
-                XCTAssertEqual(
-                    shortcuts.validationError(for: .key(reserved.shortcut), action: action),
-                    .reserved(reserved.name),
-                    "\(reserved.name) \(reserved.shortcut)"
-                )
-            }
+    func testRejectsKeysThatCannotBeRecorded() {
+        XCTAssertEqual(shortcuts.validationError(for: .modifierChord([]), action: .rewrite), .nothingPressed)
+        XCTAssertEqual(shortcuts.validationError(for: key(kVK_Command, [.shift]), action: .rewrite), .unsupportedKey)
+        XCTAssertEqual(shortcuts.validationError(for: key(0x80, []), action: .voice), .unsupportedKey)
+        XCTAssertEqual(shortcuts.validationError(for: key(kVK_ANSI_J, [.function, .command]), action: .rewrite), .unsupportedKey)
+    }
+
+    func testErrorsExplainTheReason() {
+        let errors: [ShortcutValidationError] = [.nothingPressed, .unsupportedKey, .duplicate(.restore)]
+        for error in errors {
+            XCTAssertFalse(error.errorDescription?.isEmpty ?? true)
         }
+        XCTAssertEqual(ShortcutValidationError.duplicate(.restore).errorDescription, "「復元」で使用中です。")
+    }
+
+    // MARK: Warnings
+
+    func testWarnsAboutKeysWithoutModifier() throws {
+        let layout = try XCTUnwrap(usLayout)
+        XCTAssertEqual(key(kVK_ANSI_J, []).warning(layout: layout), .typesCharacter("J"))
+        XCTAssertEqual(key(kVK_ANSI_1, []).warning(layout: layout), .typesCharacter("1"))
+        XCTAssertEqual(key(kVK_F5, []).warning(layout: layout), .replacesKey("F5"))
+        XCTAssertEqual(key(kVK_Space, []).warning(layout: layout), .replacesKey("Space"))
+        XCTAssertEqual(key(kVK_Escape, []).warning(layout: layout), .replacesKey("⎋"))
+    }
+
+    func testWarnsAboutShiftOnly() throws {
+        let layout = try XCTUnwrap(usLayout)
+        XCTAssertEqual(key(kVK_ANSI_J, [.shift]).warning(layout: layout), .uppercase("J"))
+        XCTAssertEqual(key(kVK_ANSI_1, [.shift]).warning(layout: layout), .shiftedCharacter("⇧ + 1"))
+        XCTAssertEqual(key(kVK_LeftArrow, [.shift]).warning(layout: layout), .replacesKey("⇧ + ←"))
+        // Without a layout the US letter names are used.
+        XCTAssertEqual(key(kVK_ANSI_K, [.shift]).warning(layout: nil), .uppercase("K"))
+    }
+
+    func testWarnsAboutEveryReservedSystemShortcut() {
+        for reserved in ReservedShortcut.all {
+            XCTAssertEqual(
+                ShortcutTrigger.key(reserved.shortcut).warning(layout: nil),
+                .reserved(reserved.name),
+                "\(reserved.name) \(reserved.shortcut)"
+            )
+        }
+    }
+
+    func testWarnsAboutModifierOnly() {
+        XCTAssertEqual(ShortcutTrigger.modifierChord([.command]).warning(layout: nil), .modifierOnly("⌘"))
+        XCTAssertEqual(ShortcutTrigger.fnCommand.warning(layout: nil), .modifierOnly("fn + ⌘"))
+    }
+
+    func testNoWarningForOrdinaryCombinationsAndDefaults() {
+        XCTAssertNil(key(kVK_ANSI_R, [.command, .option]).warning(layout: nil))
+        XCTAssertNil(key(kVK_ANSI_J, [.shift, .option]).warning(layout: nil))
+        XCTAssertNil(key(kVK_ANSI_J, [.command]).warning(layout: nil))
+        for action in ShortcutAction.allCases {
+            XCTAssertNil(AppShortcuts.defaults.trigger(for: action).warning(layout: nil), action.rawValue)
+        }
+    }
+
+    func testWarningTextsAskAndThenDescribeTheLoss() {
+        let warnings: [ShortcutWarning] = [
+            .typesCharacter("J"), .replacesKey("F5"), .uppercase("J"),
+            .shiftedCharacter("⇧ + 1"), .reserved("コピー"), .modifierOnly("⌘")
+        ]
+        for warning in warnings {
+            XCTAssertTrue(warning.confirmationMessage.hasSuffix("登録しますか？"), "\(warning)")
+            XCTAssertFalse(warning.note.isEmpty)
+        }
+        XCTAssertEqual(ShortcutWarning.typesCharacter("J").note, "「J」が入力できなくなっています")
+        XCTAssertEqual(
+            ShortcutWarning.reserved("コピー").confirmationMessage,
+            "この組み合わせにすると macOS・定番のショートカット（コピー）が使えなくなります。登録しますか？"
+        )
     }
 
     func testReservedListCoversRequiredSystemShortcuts() {
@@ -85,54 +160,24 @@ final class ShortcutValidationTests: XCTestCase {
         for trigger in required {
             XCTAssertTrue(reserved.contains(trigger), trigger.displayName)
         }
-        // The defaults themselves must never be reserved.
         for action in ShortcutAction.allCases {
             XCTAssertFalse(reserved.contains(AppShortcuts.defaults.trigger(for: action)), action.rawValue)
         }
     }
 
-    func testModifierOnlyIsVoiceOnlyAndNeedsTwoModifiers() {
-        let chord = ShortcutTrigger.modifierChord([.command, .shift])
-        for action in ShortcutAction.allCases where action != .voice {
-            XCTAssertEqual(shortcuts.validationError(for: chord, action: action), .modifierOnlyNotAllowed)
-        }
-        XCTAssertNil(shortcuts.validationError(for: chord, action: .voice))
-        XCTAssertNil(shortcuts.validationError(for: .fnCommand, action: .voice))
-        XCTAssertNil(shortcuts.validationError(for: .modifierChord([.function, .option]), action: .voice))
-        XCTAssertEqual(
-            shortcuts.validationError(for: .modifierChord([.command]), action: .voice),
-            .tooFewModifiers
-        )
-    }
-
-    func testRejectsModifierKeysAndFnWithOrdinaryKeys() {
-        XCTAssertEqual(shortcuts.validationError(for: key(kVK_Command, [.shift]), action: .rewrite), .unsupportedKey)
-        XCTAssertEqual(shortcuts.validationError(for: key(kVK_ANSI_J, [.function, .command]), action: .rewrite), .unsupportedKey)
-    }
-
-    func testErrorsExplainTheReason() {
-        let errors: [ShortcutValidationError] = [
-            .missingModifier, .shiftOnly, .modifierOnlyNotAllowed, .tooFewModifiers,
-            .unsupportedKey, .duplicate(.restore), .reserved("コピー")
-        ]
-        for error in errors {
-            XCTAssertFalse(error.errorDescription?.isEmpty ?? true)
-        }
-        XCTAssertEqual(ShortcutValidationError.duplicate(.restore).errorDescription, "「復元」で使用中です。")
-    }
-
-    func testSetStoresTriggerAndIgnoresChordForKeyOnlyActions() {
+    func testSetStoresTriggerForEveryAction() {
         var shortcuts = AppShortcuts.defaults
-        let optionR = HotKeyShortcut(keyCode: UInt32(kVK_ANSI_R), modifiers: [.command, .option])
+        let optionR = key(kVK_ANSI_R, [.command, .option])
 
-        shortcuts.set(.key(optionR), for: .restore)
+        shortcuts.set(optionR, for: .restore)
         shortcuts.set(.fnCommand, for: .voice)
         shortcuts.set(.modifierChord([.command, .shift]), for: .rewrite)
 
         XCTAssertEqual(shortcuts.restore, optionR)
         XCTAssertEqual(shortcuts.voiceTrigger, .fnCommand)
-        XCTAssertEqual(shortcuts.rewrite, AppShortcuts.defaultRewrite)
+        XCTAssertEqual(shortcuts.rewrite, .modifierChord([.command, .shift]))
         XCTAssertFalse(shortcuts.isDefault(.restore))
-        XCTAssertTrue(shortcuts.isDefault(.rewrite))
+        XCTAssertFalse(shortcuts.isDefault(.rewrite))
+        XCTAssertTrue(shortcuts.isDefault(.formFill))
     }
 }

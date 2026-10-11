@@ -432,7 +432,7 @@ struct SettingsView: View {
                 }
             }
 
-            Text("欄をクリックして、使いたいキーの組み合わせを押してください。Esc で中止。修飾キー（⌘ ⌥ ⌃ ⇧）と一緒に押します（F1〜F12 は単独でも可）。音声入力だけは修飾キーのみ（例: fn + ⌘）も登録できます。")
+            Text("欄をクリックして、使いたいキーの組み合わせを押してください。Esc で中止。修飾キーだけ（例: fn + ⌘、⌃）で登録するときは、押して離すと確定します。文字を入力できなくなるなど影響がある組み合わせは、登録前に確認します。")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -483,7 +483,7 @@ struct SettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            if action == .voice, let note = voiceTriggerNote {
+            ForEach(shortcutNotes(for: action), id: \.self) { note in
                 Text(note)
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
@@ -492,18 +492,23 @@ struct SettingsView: View {
         }
     }
 
-    /// System settings the current voice trigger depends on.
-    private var voiceTriggerNote: String? {
-        switch controller.shortcuts.voiceTrigger {
-        case .modifierChord(let modifiers) where modifiers.contains(.function):
-            "システム設定 > キーボード >「🌐 キーを押して」を「何もしない」にしてください（音声入力/絵文字が開くのを防ぐため）"
-        case .modifierChord:
-            "修飾キーを押した瞬間に反応します。この組み合わせで始まる他のショートカットを押したときにも反応することがあります。"
-        case .key(let shortcut) where ReservedShortcut.matching(shortcut) != nil:
-            "Spotlight などのシステムのショートカットと競合します。システム設定 > キーボード > キーボードショートカットで該当する項目をオフにするか、別のキーを登録してください。"
-        case .key:
-            nil
+    /// Warnings the user already agreed to, kept under the row, plus system
+    /// settings the trigger depends on.
+    private func shortcutNotes(for action: ShortcutAction) -> [String] {
+        let trigger = controller.shortcuts.trigger(for: action)
+        var notes: [String] = []
+        if case .modifierChord = trigger, action == .voice, voiceInput.settings.activationMode == .holdOrTap {
+            notes.append("\(trigger.displayName) を押している間だけ聞き取ります。押している間に他のキーを押すと取り消します。")
+        } else if let warning = trigger.warning {
+            notes.append(warning.note)
         }
+        if case .modifierChord(let modifiers) = trigger, modifiers.contains(.function) {
+            notes.append("システム設定 > キーボード >「🌐 キーを押して」を「何もしない」にしてください（音声入力/絵文字が開くのを防ぐため）")
+        }
+        if case .key(let shortcut) = trigger, ReservedShortcut.matching(shortcut) != nil {
+            notes.append("システムのショートカットと競合する場合は、システム設定 > キーボード > キーボードショートカットで該当する項目をオフにしてください。")
+        }
+        return notes
     }
 
     private var clipboardSection: some View {
