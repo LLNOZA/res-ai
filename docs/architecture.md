@@ -35,7 +35,9 @@ The app never presses Send. It only replaces the draft text.
 
 If replacement cannot be verified after the app attempts to insert text, ResponseAi leaves the generated reply on the clipboard and reports a manual-paste fallback instead of claiming success.
 
-`Run Readiness Check` verifies Accessibility, Screen Recording, Cloud Run proxy health, profile state, and the active hotkeys from the menu bar or Settings window.
+`Run Readiness Check` verifies Accessibility, Input Monitoring, Screen Recording, Cloud Run proxy health, profile state, and the active hotkeys from the menu bar or Settings window.
+
+Accessibility and Input Monitoring request APIs are invoked only from an explicit permission action in the menu or Settings. Launch, feature attempts, lifecycle recovery, and the permission monitor only preflight the current TCC state; they never trigger another system permission prompt.
 
 ## Native layers
 

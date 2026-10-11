@@ -66,9 +66,9 @@ struct SettingsView: View {
                 }
                     .keyboardShortcut(.defaultAction)
                 Button {
-                    controller.requestAccessibilityPermission()
+                    controller.requestHotKeyPermissionsFromUserAction()
                 } label: {
-                    Label("アクセシビリティ", systemImage: "hand.raised")
+                    Label("操作権限", systemImage: "hand.raised")
                 }
                 Button {
                     controller.requestScreenRecordingPermission()

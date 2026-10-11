@@ -101,11 +101,13 @@ Build both release artifacts:
 The generated installers are written to:
 
 ```text
-dist/installer/ResponseAi-0.3.6.pkg
-dist/installer/ResponseAi-0.3.6.dmg
+dist/installer/ResponseAi-0.3.8.pkg
+dist/installer/ResponseAi-0.3.8.dmg
 ```
 
 If a `Developer ID Application` certificate is installed, `scripts/build_app.sh` uses it for the app bundle and `scripts/build_dmg.sh` signs the DMG. If a `Developer ID Installer` certificate is installed, `scripts/build_pkg.sh` signs the installer package. Without those certificates, the scripts still build unsigned local-testing installers.
+
+Set `RESAI_CODESIGN_IDENTITY` explicitly for every release. Keeping the same bundle ID and signing identity across releases prevents macOS from treating an update as a different app and discarding its Accessibility or Input Monitoring grants. Development builds may select a sole installed identity automatically, but stop and require an explicit choice when multiple matching identities are installed.
 
 For public distribution outside the Mac App Store, notarize and staple the signed artifacts:
 
@@ -128,13 +130,17 @@ RESAI_NOTARIZE=1 \
 You can also notarize one artifact directly:
 
 ```bash
-./scripts/notarize_pkg.sh dist/installer/ResponseAi-0.3.6.pkg
-./scripts/notarize_dmg.sh dist/installer/ResponseAi-0.3.6.dmg
+./scripts/notarize_pkg.sh dist/installer/ResponseAi-0.3.8.pkg
+./scripts/notarize_dmg.sh dist/installer/ResponseAi-0.3.8.dmg
 ```
 
-On first app run, grant Accessibility permission to `ResponseAi`:
+On first app run, use `ResponseAi > アクセシビリティ／入力監視を開く` (or the `操作権限` button in Settings), then grant Accessibility and Input Monitoring permission to `ResponseAi`:
 
 `System Settings > Privacy & Security > Accessibility`
+
+`System Settings > Privacy & Security > Input Monitoring`
+
+ResponseAi never invokes the macOS permission prompts from launch, feature attempts, wake/unlock recovery, or background monitoring. Permission requests happen only after the user explicitly selects the permission command. The app passively observes the resulting state, waits to register global shortcuts until both permissions are available, and then retries automatically. If macOS asks you to quit and reopen the app after enabling Input Monitoring, restart ResponseAi from its menu.
 
 For browser apps such as Facebook Messenger, Gmail, and other web messengers, ResponseAi can optionally use visible text recognition to read context above the focused reply box. Grant Screen Recording permission when prompted, or from the menu:
 
@@ -198,7 +204,7 @@ If anything feels inactive, run:
 ResponseAi > Run Readiness Check
 ```
 
-The check shows whether Accessibility is active, whether Screen Recording is available for browser context OCR, whether the Cloud Run proxy health endpoint responds, whether the local writing profile is enabled, whether voice input is ready, and which hotkeys are active.
+The check shows whether Accessibility and Input Monitoring are active, whether Screen Recording is available for browser context OCR, whether the Cloud Run proxy health endpoint responds, whether the local writing profile is enabled, whether voice input is ready, and which hotkeys are active.
 
 ## Vertex AI config
 

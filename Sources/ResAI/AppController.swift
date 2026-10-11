@@ -24,7 +24,7 @@ final class AppController: ObservableObject {
     var onModeChange: ((RewriteMode) -> Void)?
     var onShortcutsChange: ((AppShortcuts) -> Void)?
     var onHideHUD: (() -> Void)?
-    var onAccessibilityPermissionGranted: (() -> Void)?
+    var onHotKeyPermissionsGranted: (() -> Bool)?
     var shortcutDiagnosticsProvider: (() -> [String])?
     var shortcutsAreReady: (() -> Bool)?
     /// True when the menu-bar status item is under the notch or otherwise not visible.
@@ -34,15 +34,21 @@ final class AppController: ObservableObject {
         statusDisplayName(for: lastStatus)
     }
 
+    var hotKeyPermissionsAreGranted: Bool {
+        permissionManager.hotKeyPermissionState == .granted
+    }
+
     private let permissionManager: AccessibilityPermissionManager
     private let reader: AccessibilityReader
     private let formReader: FormReader
     private let formPlanner: FormFillPlanning
     private let replacer: TextReplacer
+    private let systemSettingsURLOpener: (URL) -> Bool
     private var rewriter: TextRewriting
     private var lastReplacement: LastReplacement?
     private var pendingFormFill: PendingFormFill?
     private var permissionMonitorTask: Task<Void, Never>?
+    private var didRequestInputMonitoringDuringCurrentOnboarding = false
     private var operationTask: Task<Void, Never>?
     private var statusResetTask: Task<Void, Never>?
 
@@ -51,13 +57,15 @@ final class AppController: ObservableObject {
         reader: AccessibilityReader = AccessibilityReader(),
         formReader: FormReader = FormReader(),
         formPlanner: FormFillPlanning = FormFillPlanner(),
-        replacer: TextReplacer = TextReplacer()
+        replacer: TextReplacer = TextReplacer(),
+        systemSettingsURLOpener: @escaping (URL) -> Bool = { NSWorkspace.shared.open($0) }
     ) {
         self.permissionManager = permissionManager
         self.reader = reader
         self.formReader = formReader
         self.formPlanner = formPlanner
         self.replacer = replacer
+        self.systemSettingsURLOpener = systemSettingsURLOpener
         self.config = VertexAIConfig.load()
         self.mode = .balanced
         self.rewriteLanguage = RewriteLanguage.load()
@@ -104,8 +112,7 @@ final class AppController: ObservableObject {
         AppLog.write("rewrite flow started")
         guard permissionManager.isTrusted else {
             AppLog.write("accessibility not trusted")
-            requestAccessibilityPermission(showAlert: false)
-            startPermissionMonitor()
+            observeHotKeyPermissionsIfNeeded()
             setStatus("Needs AX")
             showHUD(HUDMessage(
                 title: "権限が未反映です",
@@ -268,8 +275,7 @@ final class AppController: ObservableObject {
         AppLog.write("form fill requested")
         guard permissionManager.isTrusted else {
             AppLog.write("form fill blocked: accessibility not trusted")
-            requestAccessibilityPermission(showAlert: false)
-            startPermissionMonitor()
+            observeHotKeyPermissionsIfNeeded()
             setStatus("Needs AX")
             showHUD(HUDMessage(
                 title: "権限が未反映です",
@@ -482,26 +488,65 @@ final class AppController: ObservableObject {
         )
     }
 
-    func requestAccessibilityPermissionIfNeeded() {
-        guard !permissionManager.isTrusted else {
-            AppLog.write("accessibility trusted")
+    /// Observe TCC state without invoking either system permission request API.
+    /// Only an explicit user action may call `requestHotKeyPermissionsFromUserAction`.
+    func observeHotKeyPermissionsIfNeeded() {
+        guard !hotKeyPermissionsAreGranted else {
+            AppLog.write("keyboard permissions granted")
             return
         }
-        AppLog.write("accessibility prompt requested on launch")
-        _ = permissionManager.requestPermissionPrompt()
-        openAccessibilitySettings()
-        startPermissionMonitor()
+        AppLog.write("keyboard permission observation started state=\(permissionManager.hotKeyPermissionState)")
+        startPermissionMonitor(continueUserInitiatedOnboarding: false)
     }
 
-    func requestAccessibilityPermission(showAlert: Bool = true) {
-        _ = permissionManager.requestPermissionPrompt()
-        openAccessibilitySettings()
-        startPermissionMonitor()
+    func requestHotKeyPermissionsFromUserAction(showAlert: Bool = true) {
+        let state = permissionManager.hotKeyPermissionState
         if showAlert {
             presentInformationalAlert(
-                title: "アクセシビリティ権限",
-                message: "システム設定 > プライバシーとセキュリティ > アクセシビリティでResponseAiをオンにしてから、もう一度実行してください。"
+                title: state == .granted ? "操作権限OK" : "ResponseAiの操作権限",
+                message: hotKeyPermissionGuidance(for: state)
             )
+        }
+        didRequestInputMonitoringDuringCurrentOnboarding = false
+        requestNextMissingHotKeyPermission(for: state)
+        if state != .granted {
+            startPermissionMonitor(continueUserInitiatedOnboarding: true)
+        }
+    }
+
+    private func requestNextMissingHotKeyPermission(for state: HotKeyPermissionState) {
+        switch state {
+        case .granted:
+            return
+        case .accessibilityRequired, .accessibilityAndInputMonitoringRequired:
+            AppLog.write("accessibility permission requested")
+            _ = permissionManager.requestPermissionPrompt()
+            openAccessibilitySettings()
+        case .inputMonitoringRequired:
+            requestInputMonitoringPermission()
+        }
+    }
+
+    private func requestInputMonitoringPermission() {
+        guard !permissionManager.isInputMonitoringEnabled else { return }
+        didRequestInputMonitoringDuringCurrentOnboarding = true
+        AppLog.write("input monitoring permission requested")
+        let granted = permissionManager.requestInputMonitoringPermission()
+        if !granted {
+            openInputMonitoringSettings()
+        }
+    }
+
+    private func hotKeyPermissionGuidance(for state: HotKeyPermissionState) -> String {
+        switch state {
+        case .granted:
+            "アクセシビリティと入力監視は有効です。"
+        case .accessibilityRequired:
+            "システム設定 > プライバシーとセキュリティ > アクセシビリティでResponseAiをオンにしてください。"
+        case .inputMonitoringRequired:
+            "システム設定 > プライバシーとセキュリティ > 入力監視でResponseAiをオンにしてください。macOSから求められた場合はResponseAiを再起動してください。"
+        case .accessibilityAndInputMonitoringRequired:
+            "まずアクセシビリティでResponseAiをオンにしてください。反映後、入力監視が必要な場合は続けて案内します。"
         }
     }
 
@@ -544,11 +589,20 @@ final class AppController: ObservableObject {
     }
 
     func showStartupStatus() {
-        let trusted = permissionManager.isTrusted
-        let ready = trusted && (shortcutsAreReady?() ?? false)
+        let permissionState = permissionManager.hotKeyPermissionState
+        let ready = permissionState == .granted && (shortcutsAreReady?() ?? false)
+        let detail: String
+        switch permissionState {
+        case .granted:
+            detail = ready ? shortcuts.rewrite.displayName : "メニューからショートカットを修復"
+        case .accessibilityRequired, .accessibilityAndInputMonitoringRequired:
+            detail = "アクセシビリティをオン"
+        case .inputMonitoringRequired:
+            detail = "入力監視をオン"
+        }
         showHUD(HUDMessage(
             title: ready ? "ResponseAi 起動中" : "ResponseAi 要確認",
-            detail: !trusted ? "アクセシビリティをオン" : (ready ? shortcuts.rewrite.displayName : "メニューからショートカットを修復"),
+            detail: detail,
             tone: ready ? .success : .warning,
             duration: ready ? 2.2 : 4.0
         ))
@@ -875,6 +929,7 @@ final class AppController: ObservableObject {
 
     private func performReadinessCheck() async {
         let accessibilityOK = permissionManager.isTrusted
+        let inputMonitoringOK = permissionManager.isInputMonitoringEnabled
         let screenRecordingOK = ScreenTextReader.hasScreenCaptureAccess()
         let loadedConfig = VertexAIConfig.load()
         let proxyStatus = await proxyHealthStatus(for: loadedConfig)
@@ -882,12 +937,13 @@ final class AppController: ObservableObject {
             ? (userProfile.isEmpty ? "プロフィール オン / 未入力" : "プロフィール オン")
             : "プロフィール オフ"
 
-        let allRequiredOK = accessibilityOK && proxyStatus.isUsable && (shortcutsAreReady?() ?? false) && voiceInput.isReady
+        let allRequiredOK = accessibilityOK && inputMonitoringOK && proxyStatus.isUsable && (shortcutsAreReady?() ?? false) && voiceInput.isReady
         let menuBarIconLine = menuBarIconHiddenByNotch
             ? "隠れています メニューバーアイコン（ノッチ）"
             : "OK メニューバーアイコン"
         let lines = [
             "\(accessibilityOK ? "OK" : "未許可") アクセシビリティ",
+            "\(inputMonitoringOK ? "OK" : "未許可") 入力監視",
             "\(screenRecordingOK ? "OK" : "未許可") 画面収録",
             "\(proxyStatus.label) AIプロキシ",
             profileStatus
@@ -896,7 +952,7 @@ final class AppController: ObservableObject {
             shortcutSummary(for: shortcuts)
         ]
 
-        AppLog.write("readiness check ax=\(accessibilityOK) screen=\(screenRecordingOK) proxy=\(proxyStatus.label) profile=\(profileStatus) menuBar=\(menuBarIconHiddenByNotch ? "notch-hidden" : "ok")")
+        AppLog.write("readiness check ax=\(accessibilityOK) inputMonitoring=\(inputMonitoringOK) screen=\(screenRecordingOK) proxy=\(proxyStatus.label) profile=\(profileStatus) menuBar=\(menuBarIconHiddenByNotch ? "notch-hidden" : "ok")")
         setStatus(allRequiredOK ? "Ready" : "Check")
         onHideHUD?()
         // A three-line HUD truncates the actual microphone/hotkey diagnostics.
@@ -982,7 +1038,13 @@ final class AppController: ObservableObject {
         }
     }
 
-    private func startPermissionMonitor() {
+    private func startPermissionMonitor(continueUserInitiatedOnboarding: Bool) {
+        // A passive status check must never cancel an explicit onboarding session,
+        // otherwise Accessibility could be granted while Input Monitoring is never
+        // offered. Explicit user actions may replace a passive monitor.
+        if permissionMonitorTask != nil, !continueUserInitiatedOnboarding {
+            return
+        }
         permissionMonitorTask?.cancel()
         permissionMonitorTask = Task { @MainActor [weak self] in
             guard let self else {
@@ -991,35 +1053,56 @@ final class AppController: ObservableObject {
 
             for attempt in 1...120 {
                 guard !Task.isCancelled else { return }
-                if self.permissionManager.isTrusted {
-                    self.onAccessibilityPermissionGranted?()
-                    AppLog.write("accessibility trusted after monitor attempt=\(attempt)")
+                let state = self.permissionManager.hotKeyPermissionState
+                if state == .granted {
+                    let shortcutsReady = self.onHotKeyPermissionsGranted?() ?? false
+                    AppLog.write("keyboard permissions granted after monitor attempt=\(attempt)")
                     self.showHUD(HUDMessage(
-                        title: "権限OK",
-                        detail: self.shortcuts.rewrite.displayName,
-                        tone: .success,
+                        title: shortcutsReady ? "権限OK" : "権限はOK",
+                        detail: shortcutsReady ? self.shortcuts.rewrite.displayName : "ショートカット登録を確認してください",
+                        tone: shortcutsReady ? .success : .warning,
                         duration: 2.4
                     ))
-                    self.setStatus((self.shortcutsAreReady?() ?? false) ? "Ready" : "Check")
+                    self.setStatus(shortcutsReady ? "Ready" : "Check")
                     self.permissionMonitorTask = nil
                     return
                 }
 
+                if continueUserInitiatedOnboarding,
+                   state == .inputMonitoringRequired,
+                   !self.didRequestInputMonitoringDuringCurrentOnboarding {
+                    self.requestInputMonitoringPermission()
+                }
+
                 if attempt == 1 || attempt % 10 == 0 {
-                    AppLog.write("accessibility still not trusted attempt=\(attempt)")
+                    AppLog.write("keyboard permissions pending state=\(state) attempt=\(attempt)")
                 }
 
                 do { try await Task.sleep(for: .seconds(1)) } catch { return }
             }
 
-            AppLog.write("accessibility monitor timed out")
-            self.showHUD(HUDMessage(
-                title: "権限がまだ未反映です",
-                detail: "権限をオンにして「ショートカットを修復」",
-                tone: .warning,
-                duration: 5.0
-            ))
+            let state = self.permissionManager.hotKeyPermissionState
+            AppLog.write("keyboard permission monitor timed out state=\(state)")
+            if continueUserInitiatedOnboarding {
+                self.showHUD(HUDMessage(
+                    title: "権限がまだ未反映です",
+                    detail: self.hotKeyPermissionTimeoutDetail(for: state),
+                    tone: .warning,
+                    duration: 5.0
+                ))
+            }
             self.permissionMonitorTask = nil
+        }
+    }
+
+    private func hotKeyPermissionTimeoutDetail(for state: HotKeyPermissionState) -> String {
+        switch state {
+        case .granted:
+            "「ショートカットを修復」を実行"
+        case .accessibilityRequired, .accessibilityAndInputMonitoringRequired:
+            "アクセシビリティをオンにしてください"
+        case .inputMonitoringRequired:
+            "入力監視をオン（反映しない場合は再起動）"
         }
     }
 
@@ -1033,8 +1116,25 @@ final class AppController: ObservableObject {
             guard let url = URL(string: urlString) else {
                 continue
             }
-            if NSWorkspace.shared.open(url) {
+            if systemSettingsURLOpener(url) {
                 AppLog.write("opened accessibility settings: \(urlString)")
+                return
+            }
+        }
+    }
+
+    private func openInputMonitoringSettings() {
+        let urls = [
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ListenEvent"
+        ]
+
+        for urlString in urls {
+            guard let url = URL(string: urlString) else {
+                continue
+            }
+            if systemSettingsURLOpener(url) {
+                AppLog.write("opened input monitoring settings: \(urlString)")
                 return
             }
         }
@@ -1050,7 +1150,7 @@ final class AppController: ObservableObject {
             guard let url = URL(string: urlString) else {
                 continue
             }
-            if NSWorkspace.shared.open(url) {
+            if systemSettingsURLOpener(url) {
                 AppLog.write("opened screen recording settings: \(urlString)")
                 return
             }

@@ -96,13 +96,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppLog.write("app launched")
         configureControllerCallbacks()
-        configureHotKey()
+        if controller.hotKeyPermissionsAreGranted {
+            configureHotKey()
+        } else {
+            AppLog.write("global hotkey registration deferred until keyboard permissions are granted")
+        }
         configureFloatingButton()
         applyDisplayPreferences()
         configurePreferencesObservation()
         configureScreenParametersObservation()
         controller.startClipboardHistoryMonitoring()
-        controller.requestAccessibilityPermissionIfNeeded()
+        controller.observeHotKeyPermissionsIfNeeded()
         controller.showStartupStatus()
         controller.voiceInput.warmUp()
         beginHotKeyActivity()
@@ -237,9 +241,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let actions = hotKeyRecoveryCoordinator.actions(
             slots: slots,
             secureInputActive: GlobalHotKeyManager.isSecureInputActive,
-            // A missing registration is retried here; Core Graphics remains the
-            // source of truth for whether the current permission is sufficient.
-            permissionAvailable: true,
+            // Do not retry a missing registration until both TCC checks say the
+            // event tap can be installed.
+            permissionAvailable: controller.hotKeyPermissionsAreGranted,
             secondsSinceExternalEvent: now - lastMonitorKeyAt
         )
         for action in actions {
@@ -269,6 +273,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func repairHotKeys(reason: String, forceRecreate: Bool = false) {
+        guard controller.hotKeyPermissionsAreGranted else {
+            lastHotKeyRecoveryDescription = "権限待ち"
+            AppLog.write("hotkey repair deferred reason=\(reason) keyboard-permissions")
+            if reason == "manual" {
+                controller.requestHotKeyPermissionsFromUserAction(showAlert: true)
+            } else {
+                controller.observeHotKeyPermissionsIfNeeded()
+            }
+            return
+        }
+
         guard !GlobalHotKeyManager.isSecureInputActive else {
             lastHotKeyRecoveryDescription = "セキュア入力中のため修復保留"
             AppLog.write("hotkey repair deferred reason=\(reason) secure-input")
@@ -344,9 +359,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controller.shortcutsAreReady = { [weak self] in
             self?.areShortcutsReady ?? false
         }
-        controller.onAccessibilityPermissionGranted = { [weak self] in
-            self?.mayRetryMissingRegistration = true
-            self?.configureHotKey(reason: "accessibility-permission-granted")
+        controller.onHotKeyPermissionsGranted = { [weak self] in
+            guard let self else { return false }
+            self.mayRetryMissingRegistration = true
+            self.configureHotKey(reason: "keyboard-permissions-granted")
+            return self.areShortcutsReady
         }
         controller.onStatusChange = { [weak self] status in
             self?.statusItem?.button?.toolTip = status == "ResponseAi" ? "ResponseAi" : status
@@ -542,8 +559,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             keyEquivalent: ","
         ))
         menu.addItem(NSMenuItem(
-            title: "アクセシビリティ権限を開く",
-            action: #selector(requestAccessibilityPermission),
+            title: "アクセシビリティ／入力監視を開く",
+            action: #selector(requestHotKeyPermissions),
             keyEquivalent: ""
         ))
         menu.addItem(NSMenuItem(
@@ -606,6 +623,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func configureHotKey(reason: String = "configuration") {
+        guard controller.hotKeyPermissionsAreGranted else {
+            hotKeyRegistrationError = "アクセシビリティ／入力監視が未許可"
+            lastHotKeyRecoveryDescription = "登録保留（権限待ち）"
+            mayRetryMissingRegistration = false
+            AppLog.write("global hotkey registration skipped reason=\(reason) keyboard-permissions")
+            return
+        }
+
         let shortcuts = controller.shortcuts.sanitized()
         if reason == "configuration", configuredShortcuts == shortcuts,
            currentHotKeyManagers.allSatisfy({ $0.1?.isRegistered == true }) {
@@ -955,8 +980,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    @objc private func requestAccessibilityPermission() {
-        controller.requestAccessibilityPermission(showAlert: true)
+    @objc private func requestHotKeyPermissions() {
+        controller.requestHotKeyPermissionsFromUserAction(showAlert: true)
     }
 
     @objc private func repairHotKeysFromMenu() {
