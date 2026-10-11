@@ -19,7 +19,8 @@ RewritePromptBuilder creates a compact prompt
 including optional local writing profile and output language
         |
 RewriteService routes:
-- Vertex AI Gemini when configured
+- Cloud Run proxy when configured (Claude API by default, Vertex AI Gemini with AI_PROVIDER=vertex)
+- direct Vertex AI Gemini for development
 - local preview rewriter when auth is missing
         |
 TextReplacer writes the generated reply back
@@ -165,15 +166,20 @@ The user can enable or disable profile use per rewrite session from Settings. Th
 
 Rewrite, Restore, and Form Fill each use a global Command + Shift shortcut. Users can change the letter key in Settings. Shortcut settings are stored locally, sanitized to avoid duplicates, used by the menu key equivalents, and re-registered immediately when changed.
 
+### AI backend
+
+For production-style use, the AI backend and model are configured centrally through Cloud Run environment variables. The Mac app UI does not expose provider, project, location, or model selection to users.
+
+- `AI_PROVIDER=anthropic` (default): the proxy calls the Claude API (`POST https://api.anthropic.com/v1/messages`) with `ANTHROPIC_MODEL`, default `claude-haiku-5-5`, for lower cost. `ANTHROPIC_API_KEY` is injected from Secret Manager.
+- `AI_PROVIDER=vertex`: rollback path to Vertex AI Gemini with `VERTEX_MODEL`, default `gemini-3.5-flash`.
+
 ### Vertex AI
 
-The request shape targets the publisher model endpoint:
+The Vertex request shape targets the publisher model endpoint:
 
 ```text
 POST /v1/projects/{project}/locations/{location}/publishers/google/models/{model}:generateContent
 ```
-
-For production-style use, the model is configured centrally through Cloud Run environment variables. The default is `gemini-3.5-flash`, because this use case benefits from stronger reply quality while keeping latency reasonable. The Mac app UI does not expose project, location, or model selection to users.
 
 The deployment project is supplied by the operator and must not be committed to the repository:
 
@@ -186,7 +192,7 @@ RESAI_GCP_PROJECT_NUMBER=<your-gcp-project-number>
 
 ### Cloud Run Proxy
 
-`services/vertex-proxy` is a dependency-free Node service deployed to Cloud Run. It checks `X-ResAI-Proxy-Key`, obtains a service-account token from Cloud Run metadata, ignores client-side model/project/location overrides, calls Vertex AI with a request timeout, sanitizes model wrappers, and returns only the generated text.
+`services/vertex-proxy` is a dependency-free Node service deployed to Cloud Run. It checks `X-ResAI-Proxy-Key`, ignores client-side model/project/location overrides, calls the Claude API (default) or Vertex AI (`AI_PROVIDER=vertex`, using a service-account token from Cloud Run metadata) with a request timeout, rejects incomplete model responses, sanitizes model wrappers, and returns only the generated text. The request/response contract with the Mac app is the same for both providers; `location` in the response is `anthropic` for the Claude API.
 
 The deployment script is idempotent and uses operator-supplied resource names:
 
@@ -194,8 +200,11 @@ The deployment script is idempotent and uses operator-supplied resource names:
 - Service account: `RESAI_CLOUD_RUN_SA`
 - Secret Manager secret: `RESAI_PROXY_SECRET_NAME`
 - Region: `RESAI_CLOUD_RUN_REGION`
+- AI provider: `RESAI_AI_PROVIDER` (`anthropic` default, `vertex` for rollback)
+- Claude model: `RESAI_ANTHROPIC_MODEL` (default `claude-haiku-5-5`)
+- Anthropic API key secret: `RESAI_ANTHROPIC_SECRET_NAME` (default `resai-anthropic-api-key`)
 
-If these resources already exist, the script reuses them. It does not create a new secret version unless `RESAI_ROTATE_PROXY_SECRET=1` is set.
+If these resources already exist, the script reuses them. It does not create a new secret version unless `RESAI_ROTATE_PROXY_SECRET=1` is set. The Anthropic API key secret is never created by the script; register it in Secret Manager before deploying with `RESAI_AI_PROVIDER=anthropic`.
 
 ## Expansion plan
 
