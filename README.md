@@ -178,7 +178,7 @@ Dictate into the focused field with:
 Command + Shift + Space
 ```
 
-Press the shortcut once to start listening and press it again to confirm and insert. Escape cancels an active session. A hold-to-talk mode (hold to listen, release to confirm) is available in `Settings > Voice`. Requires macOS 14 or later (best on macOS 26+ with on-device Apple SpeechAnalyzer; earlier versions use SFSpeechRecognizer, on-device when the locale supports it). Optional Gemini cleanup uses `gemini-3.8-flash` by default; set the API key in Settings. After cleanup, Restore (`Command + Shift + U`) reverts the last cleanup for 60 seconds, then falls back to the previous rewritten draft.
+Press the shortcut once to start listening and press it again to confirm and insert. Escape cancels an active session. A hold-to-talk mode (hold to listen, release to confirm) is available in `Settings > Voice`. Requires macOS 14 or later (best on macOS 26+ with on-device Apple SpeechAnalyzer; earlier versions use SFSpeechRecognizer, on-device when the locale supports it). Optional AI cleanup (fillers, punctuation, homophones, dictionary) goes through the Cloud Run proxy (Claude `claude-haiku-5-5` by default). Only when no proxy is configured does it call Gemini directly with the Gemini API key from Settings (`gemini-3.8-flash` by default); with neither, the raw transcript is kept. Only text is sent for cleanup, never audio. After cleanup, Restore (`Command + Shift + U`) reverts the last cleanup for 60 seconds, then falls back to the previous rewritten draft.
 
 To restore the previous draft after a replacement:
 
@@ -288,7 +288,7 @@ RESAI_DISABLE_BUNDLED_PROXY=1 ./scripts/run_app.sh
 - one-command release verification script
 - one-command release build with optional pkg/dmg notarization
 - Global hotkey
-- Voice input on macOS 14+ (SpeechAnalyzer on macOS 26+, SFSpeechRecognizer fallback earlier; press to start / press to confirm, optional hold-to-talk, Escape to cancel, on-device transcription plus optional Gemini cleanup)
+- Voice input on macOS 14+ (SpeechAnalyzer on macOS 26+, SFSpeechRecognizer fallback earlier; press to start / press to confirm, optional hold-to-talk, Escape to cancel, on-device transcription plus optional AI cleanup via the Cloud Run proxy, Gemini API key fallback)
 - Restore-last-draft hotkey (also reverts the last voice cleanup within 60 seconds)
 - Profile-based form-fill hotkey with preview-before-fill confirmation
 - Configurable Command+Shift shortcut keys for Rewrite, Restore, and Form Fill

@@ -3,7 +3,8 @@ import Foundation
 import ResAICore
 
 /// Hold-to-talk voice input with tap-to-toggle fallback: on-device transcription is inserted at
-/// the caret, then an optional Gemini cleanup pass swaps only the inserted text afterwards.
+/// the caret, then an optional AI cleanup pass (Cloud Run proxy, or Gemini directly when no
+/// proxy is configured) swaps only the inserted text afterwards.
 @MainActor
 final class VoiceInputController: ObservableObject {
     @Published var settings: VoiceInputSettings
@@ -33,6 +34,7 @@ final class VoiceInputController: ObservableObject {
     private let reader: AccessibilityReader
     private let replacer: TextReplacer
     private let permissionManager: AccessibilityPermissionManager
+    private let proxyConfigProvider: () -> VertexAIConfig
     private var phase: Phase = .idle
     private var sessionLifecycle = VoiceSessionLifecycle()
     private var activeSessionID: VoiceSessionID?
@@ -70,11 +72,13 @@ final class VoiceInputController: ObservableObject {
         replacer: TextReplacer,
         permissionManager: AccessibilityPermissionManager,
         voicePill: VoicePillController = VoicePillController(),
-        engine: (any SpeechDictating)? = nil
+        engine: (any SpeechDictating)? = nil,
+        proxyConfigProvider: @escaping () -> VertexAIConfig = { VertexAIConfig.load() }
     ) {
         self.reader = reader
         self.replacer = replacer
         self.permissionManager = permissionManager
+        self.proxyConfigProvider = proxyConfigProvider
         self.voicePill = voicePill
         self.engine = engine ?? SpeechDictationEngineFactory.make()
         self.settings = VoiceInputSettings.load()
@@ -88,6 +92,10 @@ final class VoiceInputController: ObservableObject {
 
     var hasGeminiKey: Bool {
         !geminiAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var cleanupRoute: DictationCleanupRoute {
+        .select(config: proxyConfigProvider(), hasGeminiKey: hasGeminiKey)
     }
 
     /// Downloads/reserves the on-device model ahead of the first press so start is near-instant.
@@ -279,7 +287,7 @@ final class VoiceInputController: ObservableObject {
             self.handleEngineError(error, sessionID: sessionID)
         }
 
-        if settings.cleanupEnabled, hasGeminiKey {
+        if settings.cleanupEnabled, cleanupRoute == .gemini {
             let key = geminiAPIKey
             let model = settings.geminiModel
             Task.detached {
@@ -457,7 +465,7 @@ final class VoiceInputController: ObservableObject {
             AppLog.write("voice insertion unverified (electron-style target)")
         }
 
-        let willCleanup = settings.cleanupEnabled && hasGeminiKey
+        let willCleanup = settings.cleanupEnabled && cleanupRoute != .none
         if willCleanup {
             startKeyboardSwapGuard()
         }
@@ -709,6 +717,18 @@ final class VoiceInputController: ObservableObject {
     }
 
     private func makeCleaner() -> any DictationCleaning {
+        let config = proxyConfigProvider()
+        return DictationCleanupRouter(
+            config: config,
+            proxyCleaner: ProxyDictationCleaner(client: CloudRunProxyClient(configProvider: { config })),
+            geminiCleaner: makeGeminiCleaner()
+        )
+    }
+
+    private func makeGeminiCleaner() -> (any DictationCleaning)? {
+        guard hasGeminiKey else {
+            return nil
+        }
         let key = geminiAPIKey
         let model = settings.geminiModel
         let client = GeminiAPIClient(
@@ -744,7 +764,37 @@ final class VoiceInputController: ObservableObject {
         dictionary.save()
     }
 
-    func testGeminiConnection() {
+    func testCleanupConnection() {
+        let config = proxyConfigProvider()
+        switch DictationCleanupRoute.select(config: config, hasGeminiKey: hasGeminiKey) {
+        case .proxy:
+            testProxyCleanupConnection(config: config)
+        case .gemini, .none:
+            testGeminiConnection()
+        }
+    }
+
+    private func testProxyCleanupConnection(config: VertexAIConfig) {
+        lastConnectionTestResult = "確認中..."
+        let cleaner = ProxyDictationCleaner(client: CloudRunProxyClient(configProvider: { config }))
+        let request = DictationCleanupRequest(
+            rawText: "えーと、これは接続テストです",
+            appInfo: AppInfo(name: "ResponseAi", bundleIdentifier: nil, processIdentifier: nil),
+            localeIdentifier: settings.localeIdentifier
+        )
+        Task { @MainActor [weak self] in
+            do {
+                _ = try await cleaner.cleanup(request, timeout: 10)
+                self?.lastConnectionTestResult = "接続OK（AIプロキシ経由）"
+                AppLog.write("cleanup proxy connection test ok")
+            } catch {
+                self?.lastConnectionTestResult = "接続NG（AIプロキシ）: \(error.localizedDescription)"
+                AppLog.write("cleanup proxy connection test failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func testGeminiConnection() {
         lastConnectionTestResult = "確認中..."
         let key = geminiAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let model = settings.geminiModel.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -788,8 +838,19 @@ final class VoiceInputController: ObservableObject {
             "\(isReady ? "OK" : "未準備") 音声入力エンジン (\(engineDetail))",
             "\(isSupported ? "OK" : "非対応") 音声入力 \(compactShortcut)（\(settings.activationMode.readinessLabel)）",
             "\(micStatus) マイク",
-            hasGeminiKey ? "OK Gemini整え (\(settings.geminiModel))" : "未設定 Gemini整え（生テキストのみ）"
+            cleanupReadinessLine
         ]
+    }
+
+    private var cleanupReadinessLine: String {
+        switch cleanupRoute {
+        case .proxy:
+            "OK AI整え（AIプロキシ経由）"
+        case .gemini:
+            "OK AI整え（Gemini直接 \(settings.geminiModel)）"
+        case .none:
+            "未設定 AI整え（生テキストのみ）"
+        }
     }
 
     func requestMicrophonePermission() {
